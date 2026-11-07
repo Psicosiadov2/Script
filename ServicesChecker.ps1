@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
     Psico Checker :: by Psicoseado
     Requiere PowerShell 5.1 y privilegios de administrador.
@@ -13,9 +13,11 @@
 
 # --- Configuracion de consola -------------------------------------------------
 $ErrorActionPreference = 'SilentlyContinue'
+$script:ScanIssues = [Collections.Generic.List[object]]::new()
 
 try {
-    chcp 65001 > $null
+    $chcp = Join-Path $env:SystemRoot 'System32\chcp.com'
+    if (Test-Path -LiteralPath $chcp -PathType Leaf) { & $chcp 65001 > $null }
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     $OutputEncoding = [System.Text.Encoding]::UTF8
 } catch {}
@@ -283,6 +285,128 @@ function Test-ArchiveAttribute {
     return (($Attributes -band [IO.FileAttributes]::Archive) -eq [IO.FileAttributes]::Archive)
 }
 
+function Add-ScanIssue {
+    param(
+        [string]$Area,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Area)) { $Area = 'General' }
+    if ([string]::IsNullOrWhiteSpace($Detail)) { $Detail = 'Unknown error' }
+
+    $script:ScanIssues.Add([pscustomobject]@{
+        Area   = $Area
+        Detail = $Detail
+    })
+}
+
+function Get-RegistryEvidence {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    $result = [pscustomobject]@{
+        Status    = 'Unknown'
+        Value     = $null
+        LastWrite = $null
+        Error     = $null
+    }
+
+    try {
+        $null = Get-Item -LiteralPath $Path -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $result.Status = 'Key missing'
+        return $result
+    } catch [System.UnauthorizedAccessException] {
+        $result.Status = 'Access denied'
+        $result.Error = $_.Exception.Message
+        return $result
+    } catch [System.Security.SecurityException] {
+        $result.Status = 'Access denied'
+        $result.Error = $_.Exception.Message
+        return $result
+    } catch {
+        $message = [string]$_.Exception.Message
+        if ($message -match '(?i)denied|unauthorized|not allowed|security') {
+            $result.Status = 'Access denied'
+        } else {
+            $result.Status = 'Read error'
+        }
+        $result.Error = $message
+        return $result
+    }
+
+    try {
+        $property = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+        $result.Status = 'Present'
+        $result.Value = $property.$Name
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $result.Status = 'Value missing'
+    } catch [System.UnauthorizedAccessException] {
+        $result.Status = 'Access denied'
+        $result.Error = $_.Exception.Message
+    } catch [System.Security.SecurityException] {
+        $result.Status = 'Access denied'
+        $result.Error = $_.Exception.Message
+    } catch {
+        $message = [string]$_.Exception.Message
+        if ($message -match '(?i)property.*(not found|does not exist)|no.*property') {
+            $result.Status = 'Value missing'
+        } elseif ($message -match '(?i)denied|unauthorized|not allowed|security') {
+            $result.Status = 'Access denied'
+        } else {
+            $result.Status = 'Read error'
+        }
+        $result.Error = $message
+    }
+
+    return $result
+}
+
+function Get-PathEvidence {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'Unknown' }
+
+    if (Test-Path -LiteralPath $Path) { return 'Present' }
+
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return 'Present'
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return 'Missing'
+    } catch [System.UnauthorizedAccessException] {
+        return 'Access denied'
+    } catch [System.Security.SecurityException] {
+        return 'Access denied'
+    } catch {
+        if ([string]$_.Exception.Message -match '(?i)denied|unauthorized|not allowed|security') {
+            return 'Access denied'
+        }
+        return 'Read error'
+    }
+}
+
+function Normalize-MountPoint {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    return ($Path.TrimEnd('\')).ToUpperInvariant()
+}
+
+function Get-PathValueColor {
+    param([string]$Status)
+
+    switch ($Status) {
+        'Present'       { return $successColor }
+        'Missing'       { return $textColor }
+        'Access denied' { return $warnColor }
+        'Read error'    { return $warnColor }
+        default         { return $warnColor }
+    }
+}
+
 function Format-Bytes {
     param([double]$Bytes)
 
@@ -400,61 +524,146 @@ function Get-VolumeEncryptionInfo {
     param($Volume)
 
     $info = [pscustomobject]@{
-        Encrypted  = 'NO'
-        Type       = 'CLEAR'
-        Access     = 'CLEAR'
-        LiveUnlock = 'NO'
-        MemAcquire = 'NO'
-        Priority   = 'LOW'
+        Encrypted  = 'UNKNOWN'
+        Type       = 'UNVERIFIED'
+        Access     = 'UNVERIFIED'
+        LiveUnlock = 'UNKNOWN'
+        MemAcquire = 'UNKNOWN'
+        Priority   = 'REVIEW'
+        Evidence   = 'Sin evidencia de cifrado'
     }
 
     $hasLetter = $Volume.DriveLetter -ne '[NO LETTER]'
+    $mountPoint = if ($hasLetter) { (Normalize-MountPoint $Volume.DriveLetter) } else { '' }
+    $bitLockerError = $null
+    $encryptableError = $null
+    $bitLockerRead = $false
+    $encryptableRead = $false
 
-    if ($hasLetter) {
-        $bitLockerAvailable = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
+    # 1) BitLocker management cmdlet (authoritative when available).
+    $bitLockerAvailable = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
+    if ($hasLetter -and $bitLockerAvailable) {
+        try {
+            $bitLocker = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+            $bitLockerRead = $true
+            $volumeStatus = [string]$bitLocker.VolumeStatus
+            $lockStatus = [string]$bitLocker.LockStatus
+            $protection = [string]$bitLocker.ProtectionStatus
+            $method = [string]$bitLocker.EncryptionMethod
 
-        if ($bitLockerAvailable) {
-            try {
-                $bitLocker = Get-BitLockerVolume -MountPoint $Volume.DriveLetter -ErrorAction Stop
-                if ($bitLocker.VolumeStatus -ne 'FullyDecrypted') {
-                    $info.Encrypted  = 'YES'
-                    $info.Type       = 'BITLOCKER (' + $bitLocker.EncryptionMethod + ')'
+            if ($volumeStatus -eq 'FullyDecrypted') {
+                $info.Encrypted  = 'NO'
+                $info.Type       = 'CLEAR'
+                $info.Access     = 'CLEAR'
+                $info.LiveUnlock = 'NO'
+                $info.MemAcquire = 'NO'
+                $info.Priority   = 'LOW'
+                $info.Evidence   = "BitLocker: FullyDecrypted (protection $protection)"
+            } elseif ($volumeStatus -in @('FullyEncrypted', 'EncryptionInProgress', 'EncryptionPaused', 'DecryptionInProgress', 'DecryptionPaused')) {
+                $info.Encrypted  = 'YES'
+                $info.Type       = 'BITLOCKER (' + $method + ')'
+                if ($lockStatus -eq 'Locked') {
+                    $info.Access     = 'ENCRYPTED_LOCKED'
+                    $info.LiveUnlock = 'NO'
+                    $info.MemAcquire = 'YES'
+                } else {
                     $info.Access     = 'ENCRYPTED_UNCOVERED'
                     $info.LiveUnlock = 'YES'
                     $info.MemAcquire = 'YES'
-                    $info.Priority   = 'HIGH'
                 }
-            } catch {}
+                $info.Priority = 'HIGH'
+                $info.Evidence = "BitLocker: $volumeStatus / $lockStatus (protection $protection)"
+            } else {
+                $info.Encrypted = 'UNKNOWN'
+                $info.Type      = 'BITLOCKER (' + $volumeStatus + ')'
+                $info.Evidence  = "BitLocker devolvio un estado no concluyente: $volumeStatus"
+            }
+        } catch [System.UnauthorizedAccessException] {
+            $bitLockerError = 'access denied'
+            Add-ScanIssue 'Connected drives' "BitLocker: acceso denegado para $mountPoint"
+        } catch {
+            $bitLockerError = $_.Exception.Message
+            Add-ScanIssue 'Connected drives' "BitLocker fallo para el volumen $($Volume.DriveLetter): $($bitLockerError)"
         }
+    }
 
-        if ($info.Encrypted -eq 'NO') {
-            try {
-                $mountPoint = $Volume.DriveLetter + '\'
-                $encryptable = Get-CimInstance -Namespace 'root\cimv2\security\microsoftvolumeencryption' `
-                    -ClassName Win32_EncryptableVolume -ErrorAction Stop |
-                    Where-Object { $_.DriveLetter -eq $mountPoint } |
-                    Select-Object -First 1
+    # 2) Fallback: Win32_EncryptableVolume (normalized mount point comparison).
+    if ($hasLetter -and -not $bitLockerRead) {
+        try {
+            $encryptables = @(Get-CimInstance -Namespace 'root\cimv2\security\microsoftvolumeencryption' `
+                -ClassName Win32_EncryptableVolume -ErrorAction Stop)
+            $encryptableRead = $true
 
-                if ($encryptable -and $encryptable.ProtectionStatus -eq 1) {
+            $encryptable = $encryptables |
+                Where-Object { (Normalize-MountPoint ([string]$_.DriveLetter)) -eq $mountPoint } |
+                Select-Object -First 1
+
+            if ($encryptable) {
+                $protectionStatus = [int]$encryptable.ProtectionStatus
+                if ($protectionStatus -eq 1) {
                     $info.Encrypted  = 'YES'
                     $info.Type       = 'DEVICE ENCRYPTION'
                     $info.Access     = 'ENCRYPTED_UNCOVERED'
                     $info.LiveUnlock = 'YES'
                     $info.MemAcquire = 'YES'
                     $info.Priority   = 'HIGH'
+                    $info.Evidence   = 'Win32_EncryptableVolume: ProtectionStatus=1'
+                } elseif ($protectionStatus -eq 0) {
+                    $info.Encrypted  = 'NO'
+                    $info.Type       = 'CLEAR'
+                    $info.Access     = 'CLEAR'
+                    $info.LiveUnlock = 'NO'
+                    $info.MemAcquire = 'NO'
+                    $info.Priority   = 'LOW'
+                    $info.Evidence   = 'Win32_EncryptableVolume: ProtectionStatus=0'
+                } else {
+                    $info.Encrypted = 'UNKNOWN'
+                    $info.Type      = 'DEVICE ENCRYPTION (unknown state)'
+                    $info.Evidence  = "Win32_EncryptableVolume: ProtectionStatus=$protectionStatus"
                 }
-            } catch {}
+            } else {
+                $info.Evidence = 'Win32_EncryptableVolume no reporto este volumen'
+            }
+        } catch [System.UnauthorizedAccessException] {
+            $encryptableError = 'access denied'
+            Add-ScanIssue 'Connected drives' "Win32_EncryptableVolume: acceso denegado para $mountPoint"
+        } catch {
+            $encryptableError = $_.Exception.Message
         }
     }
 
-    $fileSystem = $Volume.FileSystem
-    if (($null -eq $fileSystem -or $fileSystem -eq 'RAW') -and $Volume.Capacity -gt 1GB) {
-        $info.Encrypted  = 'YES'
-        $info.Type       = 'THIRD-PARTY FULL DISK'
-        $info.Access     = 'ENCRYPTED_LOCKED'
-        $info.LiveUnlock = 'NO'
-        $info.MemAcquire = 'YES'
-        $info.Priority   = 'CRITICAL'
+    # 3) Filesystem sanity: a RAW volume is not proof of encryption.
+    $fileSystem = [string]$Volume.FileSystem
+    if ($fileSystem -eq 'RAW' -and $info.Encrypted -ne 'YES') {
+        $info.Encrypted  = 'UNKNOWN'
+        $info.Type       = 'RAW / UNVERIFIED'
+        $info.Access     = 'UNVERIFIED'
+        $info.LiveUnlock = 'UNKNOWN'
+        $info.MemAcquire = 'UNKNOWN'
+        $info.Priority   = 'REVIEW'
+        $info.Evidence   = 'Filesystem RAW: puede estar cifrado, corrupto o sin formatear; no se puede afirmar cifrado'
+        Add-ScanIssue 'Connected drives' "Volumen RAW sin verificacion: $($Volume.DriveLetter) ($(Format-Bytes ([double]$Volume.Capacity)))"
+    } elseif (-not $hasLetter -and $info.Encrypted -ne 'YES') {
+        $info.Encrypted  = 'UNKNOWN'
+        $info.Access     = 'UNVERIFIED'
+        $info.LiveUnlock = 'UNKNOWN'
+        $info.MemAcquire = 'UNKNOWN'
+        $label = [string]$Volume.Label
+        $capacity = [double]$Volume.Capacity
+        $isSystemLike = ($label -match '(?i)system|recovery|efi|boot') -or ($capacity -gt 0 -and $capacity -le 2GB)
+        if ($isSystemLike) {
+            $info.Type     = 'NO LETTER / SYSTEM'
+            $info.Priority = 'INFO'
+            $info.Evidence = 'Particion de sistema/recuperacion: el cifrado no se puede verificar por montaje'
+        } else {
+            $info.Type     = 'NO LETTER / UNVERIFIED'
+            $info.Priority = 'REVIEW'
+            $info.Evidence = 'Volumen sin letra: no se puede verificar el cifrado por montaje'
+        }
+    } elseif ($info.Encrypted -eq 'UNKNOWN' -and -not $bitLockerRead -and -not $encryptableRead) {
+        $info.Evidence = 'No se pudo leer BitLocker ni Win32_EncryptableVolume'
+        if ($bitLockerError) { $info.Evidence += " (BitLocker: $bitLockerError)" }
+        if ($encryptableError) { $info.Evidence += " (EncryptableVolume: $encryptableError)" }
     }
 
     return $info
@@ -471,162 +680,277 @@ function Get-ServiceFacts {
     switch ($ServiceName) {
         'SysMain' {
             $prefetchKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters'
-            $prefetchValue = $null
-            try {
-                $prefetchValue = (Get-ItemProperty -LiteralPath $prefetchKey -Name 'EnablePrefetcher' -ErrorAction Stop).EnablePrefetcher
-            } catch {}
+            $prefetchEvidence = Get-RegistryEvidence -Path $prefetchKey -Name 'EnablePrefetcher'
 
-            if ($null -eq $prefetchValue) {
-                $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'Unknown'; Color = $warnColor })
-            } else {
-                $value = [int]$prefetchValue
-                $label = switch ($value) {
-                    0 { 'Disabled (0)' }
-                    1 { 'Enabled (apps)' }
-                    2 { 'Enabled (boot)' }
-                    3 { 'Enabled (apps+boot)' }
-                    default { "Value $value" }
+            switch ($prefetchEvidence.Status) {
+                'Present' {
+                    $value = $prefetchEvidence.Value
+                    if ($null -eq $value) {
+                        $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'Not set (system default)'; Color = $textColor })
+                    } else {
+                        $number = [int]$value
+                        $label = switch ($number) {
+                            0 { 'Disabled (0)' }
+                            1 { 'Enabled (apps)' }
+                            2 { 'Enabled (boot)' }
+                            3 { 'Enabled (apps+boot)' }
+                            default { "Value $number" }
+                        }
+                        $factColor = if ($number -eq 0) { $warnColor } else { $successColor }
+                        $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = $label; Color = $factColor })
+                    }
                 }
-                $factColor = if ($value -eq 0) { $dangerColor } else { $successColor }
-                $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = $label; Color = $factColor })
+                'Value missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'Not set (system default)'; Color = $textColor })
+                }
+                'Access denied' {
+                    $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+                    Add-ScanIssue 'SysMain' "No se pudo leer EnablePrefetcher: $($prefetchEvidence.Error)"
+                }
+                'Key missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'UNKNOWN (key missing)'; Color = $warnColor })
+                }
+                default {
+                    $facts.Add([pscustomobject]@{ Label = 'EnablePrefetcher:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'SysMain' "Error al leer EnablePrefetcher: $($prefetchEvidence.Error)"
+                }
             }
 
+            $prefetchDisabled = ($prefetchEvidence.Status -eq 'Present' -and $null -ne $prefetchEvidence.Value -and [int]$prefetchEvidence.Value -eq 0)
             $prefetchFolder = Join-Path $env:SystemRoot 'Prefetch'
-            $prefetchFiles = @(Get-ChildItem -LiteralPath $prefetchFolder -Filter '*.pf' -Force -File -ErrorAction SilentlyContinue)
-            $filesColor = if ($prefetchFiles.Count -eq 0) { $dangerColor } else { $textColor }
-            $facts.Add([pscustomobject]@{ Label = 'Prefetch files:'; Value = [string]$prefetchFiles.Count; Color = $filesColor })
+            $folderStatus = Get-PathEvidence $prefetchFolder
+            if ($folderStatus -eq 'Present') {
+                try {
+                    $prefetchFiles = @(Get-ChildItem -LiteralPath $prefetchFolder -Filter '*.pf' -Force -File -ErrorAction Stop)
+                    $filesColor = if ($prefetchFiles.Count -eq 0) {
+                        if ($prefetchDisabled) { $textColor } else { $warnColor }
+                    } else {
+                        $textColor
+                    }
+                    $facts.Add([pscustomobject]@{ Label = 'Prefetch files:'; Value = [string]$prefetchFiles.Count; Color = $filesColor })
+                } catch {
+                    $facts.Add([pscustomobject]@{ Label = 'Prefetch files:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'SysMain' "No se pudo enumerar Prefetch: $($_.Exception.Message)"
+                }
+            } elseif ($folderStatus -eq 'Access denied') {
+                $facts.Add([pscustomobject]@{ Label = 'Prefetch files:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+                Add-ScanIssue 'SysMain' 'Acceso denegado a la carpeta Prefetch'
+            } else {
+                $facts.Add([pscustomobject]@{ Label = 'Prefetch files:'; Value = 'Folder missing'; Color = $(if ($prefetchDisabled) { $textColor } else { $warnColor }) })
+            }
 
             $layoutPath = Join-Path $prefetchFolder 'Layout.ini'
-            $layoutColor = if (Test-Path -LiteralPath $layoutPath) { $successColor } else { $dangerColor }
-            $layoutValue = if (Test-Path -LiteralPath $layoutPath) { 'Present' } else { 'Missing' }
-            $facts.Add([pscustomobject]@{ Label = 'Layout.ini:'; Value = $layoutValue; Color = $layoutColor })
+            $layoutStatus = Get-PathEvidence $layoutPath
+            $layoutColor = if ($layoutStatus -eq 'Present') { $successColor } elseif ($layoutStatus -eq 'Missing') { $textColor } else { $warnColor }
+            $facts.Add([pscustomobject]@{
+                Label = 'Layout.ini:'
+                Value = $layoutStatus
+                Color = $layoutColor
+            })
         }
         'PcaSvc' {
-            $pcaValue = $null
-            try {
-                $pcaValue = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'DisabledPCA' -ErrorAction Stop).DisabledPCA
-            } catch {}
+            $pcaEvidence = Get-RegistryEvidence -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'DisabledPCA'
 
-            if ($null -ne $pcaValue -and [int]$pcaValue -eq 1) {
-                $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Disabled (DisabledPCA=1)'; Color = $dangerColor })
-            } else {
-                $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Enabled'; Color = $successColor })
+            switch ($pcaEvidence.Status) {
+                'Present' {
+                    if ($null -ne $pcaEvidence.Value -and [int]$pcaEvidence.Value -eq 1) {
+                        $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Disabled (DisabledPCA=1)'; Color = $warnColor })
+                    } else {
+                        $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Enabled'; Color = $successColor })
+                    }
+                }
+                'Value missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Not set (default enabled)'; Color = $textColor })
+                }
+                'Key missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'Not configured (key missing)'; Color = $textColor })
+                }
+                'Access denied' {
+                    $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+                    Add-ScanIssue 'PcaSvc' "No se pudo leer DisabledPCA: $($pcaEvidence.Error)"
+                }
+                default {
+                    $facts.Add([pscustomobject]@{ Label = 'PCA policy:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'PcaSvc' "Error al leer DisabledPCA: $($pcaEvidence.Error)"
+                }
             }
 
             $pcaStore = Join-Path $env:SystemRoot 'appcompat\pca'
-            if (Test-Path -LiteralPath $pcaStore) {
-                $storeCount = @(Get-ChildItem -LiteralPath $pcaStore -Force -File -ErrorAction SilentlyContinue).Count
-                $storeColor = if ($storeCount -eq 0) { $warnColor } else { $textColor }
-                $facts.Add([pscustomobject]@{ Label = 'PCA store:'; Value = "$storeCount files"; Color = $storeColor })
+            $storeStatus = Get-PathEvidence $pcaStore
+            if ($storeStatus -eq 'Present') {
+                try {
+                    $storeCount = @(Get-ChildItem -LiteralPath $pcaStore -Force -File -ErrorAction Stop).Count
+                    $storeColor = $textColor
+                    $facts.Add([pscustomobject]@{ Label = 'PCA store:'; Value = "$storeCount files"; Color = $storeColor })
+                } catch {
+                    $facts.Add([pscustomobject]@{ Label = 'PCA store:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'PcaSvc' "No se pudo enumerar $pcaStore : $($_.Exception.Message)"
+                }
             } else {
-                $facts.Add([pscustomobject]@{ Label = 'PCA store:'; Value = 'Missing'; Color = $dangerColor })
+                $facts.Add([pscustomobject]@{ Label = 'PCA store:'; Value = $storeStatus; Color = (Get-PathValueColor $storeStatus) })
             }
         }
         'EventLog' {
             $logFolder = Join-Path $env:SystemRoot 'System32\winevt\Logs'
-            $logCount = @(Get-ChildItem -LiteralPath $logFolder -Filter '*.evtx' -Force -File -ErrorAction SilentlyContinue).Count
-            $logColor = if ($logCount -eq 0) { $dangerColor } else { $textColor }
-            $facts.Add([pscustomobject]@{ Label = 'Event logs:'; Value = "$logCount files"; Color = $logColor })
+            $logStatus = Get-PathEvidence $logFolder
+            if ($logStatus -eq 'Present') {
+                try {
+                    $logs = @(Get-ChildItem -LiteralPath $logFolder -Filter '*.evtx' -Force -File -ErrorAction Stop)
+                    $logColor = if ($logs.Count -eq 0) { $warnColor } else { $textColor }
+                    $facts.Add([pscustomobject]@{ Label = 'Event logs:'; Value = "$($logs.Count) files"; Color = $logColor })
 
-            $logMin = @(Get-ChildItem -LiteralPath $logFolder -Filter '*.evtx' -Force -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -lt 68KB }).Count
-            $minColor = if ($logMin -gt 0) { $warnColor } else { $successColor }
-            $facts.Add([pscustomobject]@{ Label = 'Small/cleared:'; Value = [string]$logMin; Color = $minColor })
+                    $logMin = @($logs | Where-Object { $_.Length -lt 68KB }).Count
+                    $facts.Add([pscustomobject]@{ Label = 'Logs < 68KB:'; Value = [string]$logMin; Color = $textColor })
+                } catch {
+                    $facts.Add([pscustomobject]@{ Label = 'Event logs:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    $facts.Add([pscustomobject]@{ Label = 'Logs < 68KB:'; Value = 'UNKNOWN'; Color = $warnColor })
+                    Add-ScanIssue 'EventLog' "No se pudo enumerar $logFolder : $($_.Exception.Message)"
+                }
+            } else {
+                $facts.Add([pscustomobject]@{ Label = 'Event logs:'; Value = $logStatus; Color = (Get-PathValueColor $logStatus) })
+                $facts.Add([pscustomobject]@{ Label = 'Logs < 68KB:'; Value = 'UNKNOWN'; Color = $warnColor })
+                Add-ScanIssue 'EventLog' "No se pudo leer la carpeta de logs: $logStatus"
+            }
         }
         'Schedule' {
             $scheduledTasks = @()
-            try { $scheduledTasks = @(Get-ScheduledTask -ErrorAction Stop) } catch {}
+            $taskError = $null
+            try {
+                $scheduledTasks = @(Get-ScheduledTask -ErrorAction Stop)
+            } catch {
+                $taskError = $_.Exception.Message
+            }
 
             if ($scheduledTasks.Count -gt 0) {
                 $taskCount = $scheduledTasks.Count
                 $disabledTasks = @($scheduledTasks | Where-Object { [string]$_.State -eq 'Disabled' }).Count
                 $facts.Add([pscustomobject]@{ Label = 'Scheduled tasks:'; Value = [string]$taskCount; Color = $textColor })
-                $disabledColor = if ($disabledTasks -gt 0) { $warnColor } else { $successColor }
-                $facts.Add([pscustomobject]@{ Label = 'Disabled tasks:'; Value = [string]$disabledTasks; Color = $disabledColor })
+                $facts.Add([pscustomobject]@{ Label = 'Disabled tasks:'; Value = [string]$disabledTasks; Color = $textColor })
             } else {
                 $tasksFolder = Join-Path $env:SystemRoot 'System32\Tasks'
-                $taskFiles = @(Get-ChildItem -LiteralPath $tasksFolder -Force -File -Recurse -ErrorAction SilentlyContinue)
-                if ($taskFiles.Count -gt 0) {
-                    $facts.Add([pscustomobject]@{ Label = 'Task files:'; Value = [string]$taskFiles.Count; Color = $textColor })
-                    $emptyTasks = @($taskFiles | Where-Object { $_.Length -eq 0 }).Count
-                    $emptyColor = if ($emptyTasks -gt 0) { $dangerColor } else { $successColor }
-                    $facts.Add([pscustomobject]@{ Label = 'Empty tasks:'; Value = [string]$emptyTasks; Color = $emptyColor })
+                $folderStatus = Get-PathEvidence $tasksFolder
+                if ($folderStatus -eq 'Present') {
+                    try {
+                        $taskFiles = @(Get-ChildItem -LiteralPath $tasksFolder -Force -File -Recurse -ErrorAction Stop)
+                        if ($taskFiles.Count -gt 0) {
+                            $facts.Add([pscustomobject]@{ Label = 'Task files:'; Value = [string]$taskFiles.Count; Color = $textColor })
+                            $emptyTasks = @($taskFiles | Where-Object { $_.Length -eq 0 }).Count
+                            $facts.Add([pscustomobject]@{ Label = 'Empty tasks:'; Value = [string]$emptyTasks; Color = $(if ($emptyTasks -gt 0) { $warnColor } else { $textColor }) })
+                        } else {
+                            $facts.Add([pscustomobject]@{ Label = 'Scheduled tasks:'; Value = 'Unreadable'; Color = $warnColor })
+                        }
+                    } catch {
+                        $facts.Add([pscustomobject]@{ Label = 'Scheduled tasks:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                        Add-ScanIssue 'Schedule' "No se pudo enumerar $tasksFolder : $($_.Exception.Message)"
+                    }
                 } else {
-                    $facts.Add([pscustomobject]@{ Label = 'Scheduled tasks:'; Value = 'Unreadable'; Color = $warnColor })
+                    $facts.Add([pscustomobject]@{ Label = 'Scheduled tasks:'; Value = $folderStatus; Color = (Get-PathValueColor $folderStatus) })
                 }
+                if ($taskError) { Add-ScanIssue 'Schedule' "Get-ScheduledTask fallo: $taskError" }
             }
         }
         'DiagTrack' {
-            $telemetry = $null
-            try {
-                $telemetry = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry' -ErrorAction Stop).AllowTelemetry
-            } catch {}
+            $telemetryEvidence = Get-RegistryEvidence -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry'
 
-            if ($null -ne $telemetry) {
-                $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = [string]$telemetry; Color = $textColor })
-            } else {
-                $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = 'Default'; Color = $textColor })
+            switch ($telemetryEvidence.Status) {
+                'Present' {
+                    $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = [string]$telemetryEvidence.Value; Color = $textColor })
+                }
+                'Value missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = 'Not set (system default)'; Color = $textColor })
+                }
+                'Key missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = 'Not configured (key missing)'; Color = $textColor })
+                }
+                'Access denied' {
+                    $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+                    Add-ScanIssue 'DiagTrack' "No se pudo leer AllowTelemetry: $($telemetryEvidence.Error)"
+                }
+                default {
+                    $facts.Add([pscustomobject]@{ Label = 'Telemetry policy:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'DiagTrack' "Error al leer AllowTelemetry: $($telemetryEvidence.Error)"
+                }
             }
 
             $logFolder = Join-Path $env:SystemRoot 'System32\winevt\Logs'
-            $diagLogs = @(Get-ChildItem -LiteralPath $logFolder -Force -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '(?i)DiagTrack|UniversalTelemetryClient' })
-            $diagColor = if ($diagLogs.Count -gt 0) { $successColor } else { $subtColor }
-            $diagValue = if ($diagLogs.Count -gt 0) { "$($diagLogs.Count) log(s)" } else { 'Not present' }
-            $facts.Add([pscustomobject]@{ Label = 'Telemetry logs:'; Value = $diagValue; Color = $diagColor })
+            $logStatus = Get-PathEvidence $logFolder
+            if ($logStatus -eq 'Present') {
+                $diagLogs = @(Get-ChildItem -LiteralPath $logFolder -Force -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '(?i)DiagTrack|UniversalTelemetryClient' })
+                $diagColor = if ($diagLogs.Count -gt 0) { $successColor } else { $subtColor }
+                $diagValue = if ($diagLogs.Count -gt 0) { "$($diagLogs.Count) log(s)" } else { 'Not present' }
+                $facts.Add([pscustomobject]@{ Label = 'Telemetry logs:'; Value = $diagValue; Color = $diagColor })
+            } else {
+                $facts.Add([pscustomobject]@{ Label = 'Telemetry logs:'; Value = $logStatus; Color = (Get-PathValueColor $logStatus) })
+            }
         }
         'DusmSvc' {
             $sruDb = Join-Path $env:SystemRoot 'System32\sru\SRUDB.dat'
-            $sruExists = Test-Path -LiteralPath $sruDb
-            $sruColor = if ($sruExists) { $successColor } else { $dangerColor }
-            $sruText = if ($sruExists) { 'Present' } else { 'Missing' }
-            $facts.Add([pscustomobject]@{ Label = 'SRUM DB:'; Value = $sruText; Color = $sruColor })
+            $sruStatus = Get-PathEvidence $sruDb
+            $facts.Add([pscustomobject]@{ Label = 'SRUM DB:'; Value = $sruStatus; Color = (Get-PathValueColor $sruStatus) })
 
             $sruLog = Join-Path $env:SystemRoot 'System32\sru\SRU.log'
-            $sruLogExists = Test-Path -LiteralPath $sruLog
-            $facts.Add([pscustomobject]@{
-                Label = 'SRUM log:'
-                Value = if ($sruLogExists) { 'Present' } else { 'Missing' }
-                Color = if ($sruLogExists) { $successColor } else { $warnColor }
-            })
+            $sruLogStatus = Get-PathEvidence $sruLog
+            $facts.Add([pscustomobject]@{ Label = 'SRUM log:'; Value = $sruLogStatus; Color = (Get-PathValueColor $sruLogStatus) })
         }
         'Appinfo' {
-            $luaValue = $null
-            try {
-                $luaValue = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA' -ErrorAction Stop).EnableLUA
-            } catch {}
+            $luaEvidence = Get-RegistryEvidence -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA'
 
-            $uacEnabled = ($null -eq $luaValue) -or ([int]$luaValue -ne 0)
-            $uacColor = if ($uacEnabled) { $successColor } else { $dangerColor }
-            $uacText = if ($uacEnabled) { 'Enabled' } else { 'Disabled (EnableLUA=0)' }
-            $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = $uacText; Color = $uacColor })
+            switch ($luaEvidence.Status) {
+                'Present' {
+                    $uacEnabled = ([int]$luaEvidence.Value -ne 0)
+                    $uacColor = if ($uacEnabled) { $successColor } else { $dangerColor }
+                    $uacText = if ($uacEnabled) { 'Enabled' } else { 'Disabled (EnableLUA=0)' }
+                    $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = $uacText; Color = $uacColor })
+                }
+                'Value missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = 'Not set (default enabled)'; Color = $textColor })
+                }
+                'Key missing' {
+                    $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = 'Key missing (default enabled)'; Color = $textColor })
+                }
+                'Access denied' {
+                    $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+                    Add-ScanIssue 'Appinfo' "No se pudo leer EnableLUA: $($luaEvidence.Error)"
+                }
+                default {
+                    $facts.Add([pscustomobject]@{ Label = 'UAC:'; Value = 'UNKNOWN (read error)'; Color = $warnColor })
+                    Add-ScanIssue 'Appinfo' "Error al leer EnableLUA: $($luaEvidence.Error)"
+                }
+            }
         }
         'DcomLaunch' {
-            $children = 0
-            if ($ProcessId -and $processSnapshot) {
-                $children = @($processSnapshot | Where-Object { [int]$_.ParentProcessId -eq [int]$ProcessId }).Count
+            if (-not $processSnapshot) {
+                $facts.Add([pscustomobject]@{ Label = 'Child processes:'; Value = 'UNKNOWN (snapshot unavailable)'; Color = $warnColor })
+                Add-ScanIssue 'DcomLaunch' 'No se pudo obtener la lista de procesos'
+            } else {
+                $children = 0
+                if ($ProcessId) {
+                    $children = @($processSnapshot | Where-Object { [int]$_.ParentProcessId -eq [int]$ProcessId }).Count
+                }
+                $facts.Add([pscustomobject]@{ Label = 'Child processes:'; Value = [string]$children; Color = $textColor })
             }
-            $facts.Add([pscustomobject]@{ Label = 'Child processes:'; Value = [string]$children; Color = $textColor })
         }
         'WSearch' {
             $edbPath = Join-Path $env:ProgramData 'Microsoft\Search\Data\Applications\Windows\Windows.edb'
-            $edbExists = Test-Path -LiteralPath $edbPath
-            $edbColor = if ($edbExists) { $successColor } else { $dangerColor }
-            $edbText = if ($edbExists) { 'Present' } else { 'Missing' }
-            $facts.Add([pscustomobject]@{ Label = 'Index DB:'; Value = $edbText; Color = $edbColor })
+            $edbStatus = Get-PathEvidence $edbPath
+            $facts.Add([pscustomobject]@{ Label = 'Index DB:'; Value = $edbStatus; Color = (Get-PathValueColor $edbStatus) })
         }
         'BAM' {
             $bamState = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State'
-            $bamExists = Test-Path -LiteralPath $bamState
-            $bamColor = if ($bamExists) { $successColor } else { $dangerColor }
-            $bamText = if ($bamExists) { 'Present' } else { 'Missing' }
-            $facts.Add([pscustomobject]@{ Label = 'BAM state:'; Value = $bamText; Color = $bamColor })
+            $bamStatus = Get-PathEvidence $bamState
+            $facts.Add([pscustomobject]@{ Label = 'BAM state:'; Value = $bamStatus; Color = (Get-PathValueColor $bamStatus) })
         }
         'DPS' {
             $wdiKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WDI'
-            $wdiExists = Test-Path -LiteralPath $wdiKey
-            $wdiText = if ($wdiExists) { 'Present' } else { 'Default' }
-            $facts.Add([pscustomobject]@{ Label = 'WDI policy:'; Value = $wdiText; Color = $textColor })
+            $wdiStatus = Get-PathEvidence $wdiKey
+            if ($wdiStatus -eq 'Present') {
+                $facts.Add([pscustomobject]@{ Label = 'WDI policy:'; Value = 'Configured'; Color = $textColor })
+            } elseif ($wdiStatus -eq 'Access denied') {
+                $facts.Add([pscustomobject]@{ Label = 'WDI policy:'; Value = 'UNKNOWN (access denied)'; Color = $warnColor })
+            } else {
+                $facts.Add([pscustomobject]@{ Label = 'WDI policy:'; Value = 'Not configured'; Color = $textColor })
+            }
         }
     }
 
@@ -642,6 +966,18 @@ function Get-ServiceEventFacts {
     $facts = @{}
     $since = if ($BootTime) { $BootTime.AddMinutes(-1) } else { (Get-Date).AddDays(-7) }
 
+    $meta = [pscustomobject]@{
+        Has7036       = $false
+        NoEvents7036  = $false
+        ReadError7036 = $false
+        Has7040       = $false
+        NoEvents7040  = $false
+        ReadError7040 = $false
+        Has7045       = $false
+        LastError     = $null
+    }
+    $facts['__meta'] = $meta
+
     foreach ($eventId in @(7036, 7040, 7045)) {
         $events = @()
         try {
@@ -651,7 +987,26 @@ function Get-ServiceEventFacts {
                 StartTime = $since
             } -ErrorAction Stop)
         } catch {
+            $meta.LastError = $_.Exception.Message
+            $noEvents = $meta.LastError -match '(?i)No events were found|No matching events'
+            if ($noEvents) {
+                if ($eventId -eq 7036) { $meta.Has7036 = $true; $meta.NoEvents7036 = $true }
+                elseif ($eventId -eq 7040) { $meta.Has7040 = $true; $meta.NoEvents7040 = $true }
+                elseif ($eventId -eq 7045) { $meta.Has7045 = $true }
+            } else {
+                if ($eventId -eq 7036) { $meta.ReadError7036 = $true }
+                elseif ($eventId -eq 7040) { $meta.ReadError7040 = $true }
+                if ($eventId -eq 7036) {
+                    Add-ScanIssue 'Service Status' "No se pudieron leer eventos SCM 7036: $($meta.LastError)"
+                }
+            }
             continue
+        }
+
+        switch ($eventId) {
+            7036 { $meta.Has7036 = $true }
+            7040 { $meta.Has7040 = $true }
+            7045 { $meta.Has7045 = $true }
         }
 
         foreach ($event in $events) {
@@ -683,15 +1038,19 @@ function Get-ServiceEventFacts {
 
                     if (-not $facts.ContainsKey($key)) {
                         $facts[$key] = [pscustomobject]@{
-                            Restarts = [Collections.Generic.List[datetime]]::new()
+                            Starts   = [Collections.Generic.List[datetime]]::new()
+                            Stops    = [Collections.Generic.List[datetime]]::new()
                             Changes  = [Collections.Generic.List[object]]::new()
                             Installs = [Collections.Generic.List[datetime]]::new()
                         }
                     }
 
                     if ($eventId -eq 7036) {
-                        if ([string]$data['param2'] -eq 'running') {
-                            $facts[$key].Restarts.Add($event.TimeCreated)
+                        $state = [string]$data['param2']
+                        if ($state -eq 'running') {
+                            $facts[$key].Starts.Add($event.TimeCreated)
+                        } elseif ($state -eq 'stopped') {
+                            $facts[$key].Stops.Add($event.TimeCreated)
                         }
                     } elseif ($eventId -eq 7040) {
                         $facts[$key].Changes.Add([pscustomobject]@{
@@ -818,9 +1177,11 @@ function Get-LaunchInfo {
         }
 
         if ($name -match '^(?:Dloader\.(?:addMods|modsFolder|modsDir)|Dfabric\.(?:addMods|modsFolder|modsDir)|javaagent|workdir)$') {
-            $argumentColor = $dangerColor
+            $argumentColor = $warnColor
             if ($name -eq 'javaagent' -and $value -and $value -match '(?i)theseus\.jar') {
                 $argumentColor = $successColor
+            } elseif ($name -eq 'workdir') {
+                $argumentColor = $subtColor
             }
 
             $info.Arguments.Add([pscustomobject]@{
@@ -849,7 +1210,16 @@ function Get-JavaLauncherExecutions {
         '\[(?<d>\d{1,2}/\d{1,2}/\d{4}[ T]\d{1,2}:\d{2}:\d{2})'
     )
 
-    foreach ($line in @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+    $script:JavaLauncherReadError = $null
+    $lines = @()
+    try {
+        $lines = @(Get-Content -LiteralPath $Path -ErrorAction Stop)
+    } catch {
+        $script:JavaLauncherReadError = $_.Exception.Message
+        Add-ScanIssue 'TEMP' "No se pudo leer $Path : $($_.Exception.Message)"
+    }
+
+    foreach ($line in $lines) {
         $lineDate = $null
 
         foreach ($regex in $dateRegexes) {
@@ -901,104 +1271,264 @@ function Get-DeletedPrefetchCount {
     param([string]$Volume = 'C:')
 
     $result = [pscustomobject]@{
-        Count  = 0
+        Events = $null
+        Files  = $null
         Status = 'Unavailable'
+        Detail = $null
     }
 
     $token   = [guid]::NewGuid().ToString('N')
-    $outFile = Join-Path $env:TEMP ('psico_prefetch_usn_' + $token + '.txt')
-    $errFile = Join-Path $env:TEMP ('psico_prefetch_usn_' + $token + '.err')
-    $batFile = Join-Path $env:TEMP ('psico_prefetch_usn_' + $token + '.cmd')
-    $letter  = $Volume.TrimEnd(':')
+    $runDir  = Join-Path $env:TEMP ('psico_usn_' + $token)
+    $outFile = Join-Path $runDir 'journal.csv'
+    $errFile = Join-Path $runDir 'journal.err'
+    $letter  = ($Volume -replace '[:\\/]', '').Trim()
 
+    if ([string]::IsNullOrWhiteSpace($letter)) {
+        $result.Status = 'Invalid volume'
+        return $result
+    }
+
+    $fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+    if (-not (Test-Path -LiteralPath $fsutil -PathType Leaf)) {
+        $result.Status = 'fsutil missing'
+        $result.Detail = $fsutil
+        Add-ScanIssue 'Prefetch / USN' "No se encontro fsutil.exe en $fsutil"
+        return $result
+    }
+
+    $prefetchRel = '\Windows\Prefetch'
+    if ($env:SystemRoot -match '^[A-Za-z]:\\(.*)$') {
+        $prefetchRel = '\' + $Matches[1].TrimEnd('\') + '\Prefetch'
+    }
+    $prefetchPrefix = ($prefetchRel.TrimEnd('\') + '\').ToUpperInvariant()
+
+    $process = $null
+    $parser = $null
     try {
-        $batch = '@echo off' + "`r`n" +
-            'fsutil usn readjournal ' + $letter + ': csv 2> "' + $errFile + '" | findstr /I /C:"\Windows\Prefetch" /C:"Access is denied" > "' + $outFile + '"' + "`r`n"
-        [IO.File]::WriteAllText($batFile, $batch, [Text.Encoding]::Default)
+        $null = New-Item -ItemType Directory -Path $runDir -Force -ErrorAction Stop
 
-        $process = Start-Process -FilePath $batFile -WindowStyle Hidden -PassThru -ErrorAction Stop
-        $finished = $process.WaitForExit(30000)
+        $process = Start-Process -FilePath $fsutil `
+            -ArgumentList @('usn', 'readjournal', ($letter + ':'), 'csv') `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError $errFile `
+            -ErrorAction Stop
+
+        $fsutilTimeoutMs = 180000
+        $finished = $process.WaitForExit($fsutilTimeoutMs)
         if (-not $finished) {
             try { $process.Kill() } catch {}
+            $result.Status = 'Timeout'
+            $result.Detail = "fsutil no termino en $([int]($fsutilTimeoutMs / 1000)) segundos"
+            Add-ScanIssue 'Prefetch / USN' 'fsutil usn readjournal supero el tiempo limite'
+            return $result
         }
 
-        if (Test-Path -LiteralPath $outFile) {
-            $nameIndex       = 1
-            $reasonIndex     = 3
-            $reasonTextIndex = 4
-            $headerSeen      = $false
-            $errorSeen       = $false
-            $deleted         = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $errText = ''
+        if (Test-Path -LiteralPath $errFile) {
+            $errText = [IO.File]::ReadAllText($errFile).Trim()
+        }
 
-            foreach ($line in [IO.File]::ReadLines($outFile)) {
-                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($errText -match '(?i)access is denied|denied|privilege|not have') {
+            $result.Status = 'Access denied'
+            $result.Detail = $errText
+            Add-ScanIssue 'Prefetch / USN' "fsutil denego el acceso al journal: $errText"
+            return $result
+        }
 
-                if ($line -match '(?i)access is denied') {
-                    $errorSeen = $true
-                    continue
-                }
+        $exitCode = 'unknown'
+        try {
+            $process.Refresh()
+            $exitValue = $process.ExitCode
+            if ($null -ne $exitValue) { $exitCode = $exitValue }
+        } catch {}
 
-                if (-not $headerSeen -and $line -match '(?i)^Usn,') {
-                    $header = $line.Split(',')
-                    for ($i = 0; $i -lt $header.Count; $i++) {
-                        $column = $header[$i].Trim()
-                        if ($column -match '(?i)^file\s*name$') { $nameIndex = $i }
-                        elseif ($column -match '(?i)^reason\s*#$') { $reasonIndex = $i }
-                        elseif ($column -match '(?i)^reason$') { $reasonTextIndex = $i }
-                    }
-                    $headerSeen = $true
-                    continue
-                }
-
-                $fields = $line.Split(',')
-                $maxIndex = [Math]::Max($nameIndex, [Math]::Max($reasonIndex, $reasonTextIndex))
-                if ($fields.Count -le $maxIndex) { continue }
-
-                $name = $fields[$nameIndex]
-                if ($name -notmatch '(?i)\\Windows\\Prefetch\\.+\.pf') { continue }
-
-                $isDelete = $false
-                $reasonText = $fields[$reasonIndex].Trim()
-
-                if ($reasonText -match '^0x[0-9A-Fa-f]+$') {
-                    $reason = [Convert]::ToInt64($reasonText.Substring(2), 16)
-                    $isDelete = (($reason -band 0x200) -ne 0 -and ($reason -band 0x80000000) -ne 0)
-                } elseif ($reasonText -match '^\d+$') {
-                    $reason = [Convert]::ToInt64($reasonText)
-                    $isDelete = (($reason -band 0x200) -ne 0 -and ($reason -band 0x80000000) -ne 0)
-                }
-
-                if (-not $isDelete -and $fields[$reasonTextIndex] -match '(?i)FILE_DELETE') {
-                    $isDelete = $true
-                }
-
-                if ($isDelete) {
-                    [void]$deleted.Add($name)
-                }
-            }
-
-            if ($errorSeen) {
-                $result.Count = 0
-                $result.Status = 'Unavailable'
-            } else {
-                $result.Count = $deleted.Count
-                $result.Status = if (-not $finished) { 'Partial (timeout)' } else { 'OK' }
-
-                if (Test-Path -LiteralPath $errFile) {
-                    $errText = [IO.File]::ReadAllText($errFile)
-                    if ($errText -match '(?i)access is denied|error|failed|denied') {
-                        $result.Count = 0
-                        $result.Status = 'Unavailable'
-                    }
-                }
-            }
-        } else {
+        if (-not (Test-Path -LiteralPath $outFile)) {
             $result.Status = 'No output'
+            $result.Detail = if ($errText) { $errText } else { "fsutil no genero salida (exit code $exitCode)" }
+            Add-ScanIssue 'Prefetch / USN' 'fsutil no genero salida CSV'
+            return $result
         }
+
+        $firstLine = Get-Content -LiteralPath $outFile -TotalCount 1 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($firstLine)) {
+            $result.Status = 'No output'
+            $result.Detail = if ($errText) { $errText } else { "La salida CSV del journal esta vacia (exit code $exitCode)" }
+            Add-ScanIssue 'Prefetch / USN' 'La salida CSV del journal esta vacia'
+            return $result
+        }
+
+        $outputHead = @(Get-Content -LiteralPath $outFile -TotalCount 5 -ErrorAction SilentlyContinue)
+        $combinedHead = ($errText + ' ' + ($outputHead -join ' '))
+        if ($combinedHead -match '(?i)access is denied|access denied|not have|privilege') {
+            $result.Status = 'Access denied'
+            $result.Detail = $combinedHead.Trim()
+            Add-ScanIssue 'Prefetch / USN' "fsutil denego el acceso al journal: $($result.Detail)"
+            return $result
+        }
+
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+        $parser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($outFile)
+        $parser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
+        $parser.SetDelimiters(',')
+        $parser.HasFieldsEnclosedInQuotes = $true
+        $parser.TrimWhiteSpace = $false
+
+        $header = $null
+        while (-not $parser.EndOfData) {
+            $fields = $null
+            try { $fields = $parser.ReadFields() } catch { break }
+            if ($null -eq $fields -or $fields.Count -lt 2) { continue }
+            if ($fields[0] -ne 'Usn') { continue }
+            if ([Array]::IndexOf($fields, 'File name') -ge 0) { $header = $fields; break }
+        }
+
+        if (-not $header) {
+            $result.Status = 'Parse error'
+            $result.Detail = 'No se encontro la cabecera CSV (Usn, File name, ...) en la salida de fsutil'
+            Add-ScanIssue 'Prefetch / USN' $result.Detail
+            return $result
+        }
+
+        $nameIdx = [Array]::IndexOf($header, 'File name')
+        $reasonIdx = [Array]::IndexOf($header, 'Reason #')
+        $reasonTextIdx = [Array]::IndexOf($header, 'Reason')
+        $parentIdx = [Array]::IndexOf($header, 'Parent file ID')
+
+        if ($nameIdx -lt 0 -or $reasonIdx -lt 0) {
+            $result.Status = 'Parse error'
+            $result.Detail = 'Faltan columnas esperadas (File name, Reason #)'
+            Add-ScanIssue 'Prefetch / USN' $result.Detail
+            return $result
+        }
+
+        # fsutil emits only leaf names, so the directory must be resolved through Parent file ID.
+        $prefetchFullPath = Join-Path $env:SystemRoot 'Prefetch'
+        $prefetchId = $null
+        $idError = $null
+        try {
+            $idOutput = @(& $fsutil file queryfileid $prefetchFullPath 2>&1)
+            $idText = (($idOutput | ForEach-Object { [string]$_ }) -join ' ').Trim()
+            $idMatch = [regex]::Match($idText, '(?i)File ID is\s+(0x[0-9A-Fa-f]+)')
+            if ($idMatch.Success) {
+                $prefetchId = $idMatch.Groups[1].Value.Substring(2).PadLeft(32, '0').ToLowerInvariant()
+            } else {
+                $idError = $idText
+            }
+        } catch {
+            $idError = $_.Exception.Message
+        }
+
+        $deleteEvents = 0
+        $deletedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $totalRows = 0
+        $pfRows = 0
+        $parseFailures = 0
+        $hasPathNames = $false
+
+        while (-not $parser.EndOfData) {
+            $fields = $null
+            try {
+                $fields = $parser.ReadFields()
+            } catch {
+                $parseFailures++
+                continue
+            }
+            if ($null -eq $fields) { continue }
+            if ($fields.Count -le $nameIdx) { continue }
+            $totalRows++
+
+            $name = [string]$fields[$nameIdx]
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+            $leaf = $name
+            $inPrefetch = $false
+
+            if ($name.IndexOf('\') -ge 0 -or $name.IndexOf('/') -ge 0 -or $name -match '^[A-Za-z]:') {
+                $hasPathNames = $true
+                $normalized = ($name -replace '/', '\')
+                $normalized = ($normalized -replace '^\\\\\?\\', '')
+                $normalized = ($normalized -replace '^\\\?\?\\', '')
+                $normalized = ($normalized -replace '\\{2,}', '\')
+                if ($normalized -match '^[A-Za-z]:') { $normalized = $normalized.Substring(2) }
+                $normalized = '\' + $normalized.TrimStart('\')
+                $upperPath = $normalized.ToUpperInvariant()
+
+                if ($upperPath.StartsWith($prefetchPrefix, [StringComparison]::OrdinalIgnoreCase) -and $upperPath.Length -gt $prefetchPrefix.Length) {
+                    $inPrefetch = $true
+                    $leaf = $normalized.Substring($normalized.LastIndexOf('\') + 1)
+                }
+            } elseif ($null -ne $prefetchId -and $parentIdx -ge 0 -and $fields.Count -gt $parentIdx) {
+                $recordParent = ([string]$fields[$parentIdx]).Trim().ToLowerInvariant()
+                if ($recordParent -match '^[0-9A-Fa-f]{1,32}$') {
+                    $recordParent = $recordParent.PadLeft(32, '0')
+                    if ($recordParent -eq $prefetchId) { $inPrefetch = $true }
+                }
+            }
+
+            if (-not $inPrefetch) { continue }
+            if (-not $leaf.EndsWith('.pf', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $pfRows++
+
+            $reasonRaw = [string]$fields[$reasonIdx]
+            $reasonText = ''
+            if ($reasonTextIdx -ge 0 -and $fields.Count -gt $reasonTextIdx) {
+                $reasonText = [string]$fields[$reasonTextIdx]
+            }
+
+            $isDelete = $false
+            $reasonValue = $null
+            if ($reasonRaw -match '^0x([0-9A-Fa-f]{1,16})$') {
+                $reasonValue = [Convert]::ToInt64($Matches[1], 16)
+            } elseif ($reasonRaw -match '^\d{1,19}$') {
+                $reasonValue = [Convert]::ToInt64($reasonRaw)
+            }
+
+            if ($null -ne $reasonValue) {
+                $isDelete = (($reasonValue -band 0x200) -ne 0)
+            } elseif ($reasonText -match '(?i)delete') {
+                $isDelete = $true
+            }
+
+            if ($isDelete) {
+                $deleteEvents++
+                [void]$deletedFiles.Add($leaf.ToUpperInvariant())
+            }
+        }
+
+        if ($null -eq $prefetchId -and -not $hasPathNames) {
+            $result.Status = 'Unknown (Prefetch folder ID unavailable)'
+            $result.Detail = if ($idError) {
+                "No se pudo verificar que los .pf pertenezcan a $prefetchFullPath : $idError"
+            } else {
+                "No se pudo obtener el File ID de $prefetchFullPath"
+            }
+            Add-ScanIssue 'Prefetch / USN' $result.Detail
+            return $result
+        }
+
+        if ($parseFailures -gt 0) {
+            Add-ScanIssue 'Prefetch / USN' "$parseFailures linea(s) del journal no se pudieron parsear"
+        }
+
+        $methodText = if ($hasPathNames) { 'ruta completa' } else { "parent file ID 0x$prefetchId" }
+
+        $result.Events = $deleteEvents
+        $result.Files = $deletedFiles.Count
+        $result.Detail = "Filas: $totalRows; .pf en Prefetch: $pfRows; metodo: $methodText"
+        $result.Status = 'OK'
     } catch {
-        $result.Status = 'Unavailable'
+        $result.Status = 'Read error'
+        $result.Detail = $_.Exception.Message
+        Add-ScanIssue 'Prefetch / USN' "Error al ejecutar fsutil: $($_.Exception.Message)"
     } finally {
-        Remove-Item -LiteralPath $outFile, $errFile, $batFile -Force -ErrorAction SilentlyContinue
+        if ($parser) {
+            try { $parser.Close() } catch {}
+        }
+        if ($process -and -not $process.HasExited) {
+            try { $process.Kill() } catch {}
+        }
+        Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     return $result
@@ -1089,6 +1619,8 @@ if ($drives.Count -gt 0) {
         $priorityColor = switch ($encryption.Priority) {
             'CRITICAL' { $dangerColor }
             'HIGH'     { $warnColor }
+            'REVIEW'   { $warnColor }
+            'INFO'     { $subtColor }
             default    { $successColor }
         }
 
@@ -1106,6 +1638,9 @@ if ($drives.Count -gt 0) {
         Write-Field 'Live:' $encryption.LiveUnlock $fieldWidth $textColor $priorityColor
         Write-Field 'RAM:' $encryption.MemAcquire $fieldWidth $textColor $priorityColor
         Write-Field 'Priority:' $encryption.Priority $fieldWidth $textColor $priorityColor
+        if ($encryption.Evidence) {
+            Write-Host ($infoIndex + '  |- ' + $encryption.Evidence) -ForegroundColor $subtColor
+        }
     }
 } else {
     Write-Host ($infoIndex + 'No drives found') -ForegroundColor $warnColor
@@ -1232,7 +1767,7 @@ if ($jarLaunches.Count -eq 0) {
     Write-Host ($infoIndex + 'No java -jar launches found since boot.') -ForegroundColor $successColor
 } else {
     Write-Host ($infoIndex + 'Launch(es):'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
-    Write-Host ([string]$jarLaunches.Count) -ForegroundColor $warnColor
+    Write-Host ([string]$jarLaunches.Count) -ForegroundColor $textColor
 
     $counter = 0
     foreach ($launch in $jarLaunches) {
@@ -1242,13 +1777,13 @@ if ($jarLaunches.Count -eq 0) {
 
         Write-Host ($infoIndex + "  $counter. $launchDate  PID $($launch.ProcessId)  $($launch.Name)") -ForegroundColor $titleColor
         Write-Host ($infoIndex + '     |- Jar:        ') -ForegroundColor $subtColor -NoNewline
-        Write-Host $jarText -ForegroundColor $warnColor
+        Write-Host $jarText -ForegroundColor $textColor
         Write-Host ($infoIndex + '     |- Parent:     ') -ForegroundColor $subtColor -NoNewline
         Write-Host ("$($launch.ParentName) ($($launch.ParentPid))") -ForegroundColor $textColor
         Write-Host ($infoIndex + '     |- DcomLaunch: ') -ForegroundColor $subtColor -NoNewline
 
         if ($launch.UnderDcomLaunch) {
-            Write-Host 'Yes' -ForegroundColor $dangerColor
+            Write-Host 'Yes (normal for jar launched from Explorer)' -ForegroundColor $textColor
         } else {
             Write-Host 'No' -ForegroundColor $textColor
         }
@@ -1451,7 +1986,7 @@ foreach ($serviceName in $serviceNames) {
 $serviceNumber = 0
 foreach ($service in $serviceInfo) {
     $serviceNumber++
-    $statusColor = if ($service.State -eq 'Running') { $successColor } else { $dangerColor }
+    $statusColor = if ($service.State -eq 'Running') { $successColor } else { $warnColor }
     $startTimeText = if ($service.Start) {
         $service.Start.ToString($formatDate)
     } elseif ($service.State -eq 'Running') {
@@ -1461,47 +1996,77 @@ foreach ($service in $serviceInfo) {
     }
 
     $eventInfo = $serviceEvents[$service.Name]
-    $restartTimes = [Collections.Generic.List[datetime]]::new()
+    $eventMeta = $serviceEvents['__meta']
+    $starts = @()
+    $stops = @()
     $changes = @()
     $installs = @()
 
     if ($eventInfo) {
+        $starts = @($eventInfo.Starts)
+        $stops = @($eventInfo.Stops)
         $changes = @($eventInfo.Changes)
         $installs = @($eventInfo.Installs)
-
-        foreach ($restartTime in @($eventInfo.Restarts)) {
-            if ($bootTime -and $restartTime -gt $bootTime.AddMinutes(2)) {
-                $restartTimes.Add($restartTime)
-            }
-        }
     }
 
-    $processRestarted = ($service.Start -and $bootTime -and ($service.Start -gt $bootTime.AddMinutes(2)))
-
-    if ($processRestarted) {
-        $restartTimes.Add($service.Start)
+    $sharedPid = $false
+    if ($service.PID) {
+        $sharedPid = @($allServices | Where-Object { $_.ProcessId -eq $service.PID }).Count -gt 1
     }
 
-    $restartTimes = @($restartTimes | Sort-Object)
-    $restarted = ($restartTimes.Count -gt 0)
+    # A restart requires SCM evidence: a stop followed by a start. Never infer it
+    # from a late process creation time, which is normal on slow boots.
+    $restartTimes = [Collections.Generic.List[datetime]]::new()
+    foreach ($stopTime in $stops) {
+        $nextStart = $starts | Where-Object { $_ -gt $stopTime } | Sort-Object | Select-Object -First 1
+        if ($nextStart) { $restartTimes.Add($nextStart) }
+    }
+    $restartTimes = @($restartTimes | Sort-Object -Unique)
 
-    if ($restarted) {
+    $ownScmEvidence = (($starts.Count + $stops.Count) -gt 0)
+
+    if ($restartTimes.Count -gt 0) {
         $lastRestart = $restartTimes[-1]
-        $restartedText = 'Yes (' + $lastRestart.ToString($formatDate) + ')'
-        $restartedColor = $dangerColor
+        $restartedText = 'Yes (' + $lastRestart.ToString($formatDate) + ') - context only'
+        $restartedColor = $warnColor
+    } elseif ($sharedPid -and -not $ownScmEvidence) {
+        $restartedText = 'Unknown (shared PID ' + $service.PID
+        if ($eventMeta -and $eventMeta.ReadError7036) { $restartedText += '; 7036 read error' }
+        elseif ($eventMeta -and $eventMeta.NoEvents7036) { $restartedText += '; no 7036 events since boot' }
+        else { $restartedText += '; no per-service 7036 evidence' }
+        $restartedText += ')'
+        $restartedColor = $warnColor
+    } elseif (-not $eventMeta -or $eventMeta.ReadError7036) {
+        $restartedText = 'Unknown (7036 read error)'
+        $restartedColor = $warnColor
+    } elseif ($eventMeta.NoEvents7036) {
+        $restartedText = 'Unknown (no 7036 events since boot)'
+        $restartedColor = $warnColor
+    } elseif ($ownScmEvidence) {
+        $restartedText = 'No (no SCM stop/start)'
+        $restartedColor = $successColor
     } else {
-        $restartedText = 'No'
+        $restartedText = 'No (no 7036 events for this service)'
         $restartedColor = $successColor
     }
 
     if ($changes.Count -gt 0) {
-        $lastChange = $changes[-1]
+        $lastChange = $changes | Sort-Object Time | Select-Object -Last 1
         $changeText = $lastChange.From + ' -> ' + $lastChange.To + ' (' + $lastChange.Time.ToString($formatDate) + ')'
-        if ($changes.Count -gt 1) { $changeText += " +$($changes.Count - 1) more" }
-        $changeColor = $dangerColor
-    } else {
-        $changeText = 'No'
+        if ($changes.Count -gt 1) { $changeText += " - $($changes.Count) changes total" }
+        $changeColor = $warnColor
+    } elseif ($eventMeta -and $eventMeta.ReadError7040) {
+        $changeText = 'Unknown (7040 read error)'
+        $changeColor = $warnColor
+    } elseif ($eventMeta -and $eventMeta.NoEvents7040) {
+        $changeText = 'Unknown (no 7040 events since boot)'
+        $changeColor = $warnColor
+    } elseif ($eventMeta -and $eventMeta.Has7040) {
+        $changeText = 'No (no 7040 change)'
         $changeColor = $successColor
+    } else {
+        $changeText = 'Unknown (7040 unavailable)'
+        $changeColor = $warnColor
     }
 
     if ($serviceNumber -gt 1) {
@@ -1509,7 +2074,8 @@ foreach ($service in $serviceInfo) {
     }
 
     Write-ThinSeparator
-    Write-Host ($infoIndex + $service.Name.PadRight(16)) -ForegroundColor $titleColor -NoNewline
+    $serviceLabel = if ($service.Name -ieq 'BAM') { 'BAM' } else { $service.Name }
+    Write-Host ($infoIndex + $serviceLabel.PadRight(16)) -ForegroundColor $titleColor -NoNewline
     Write-Host ($service.State.PadRight(12)) -ForegroundColor $statusColor -NoNewline
     $pidText = if ($service.PID) { "PID $($service.PID)" } elseif ($service.IsDriver) { 'Driver' } else { 'PID N/A' }
     Write-Host $pidText -ForegroundColor $subtColor
@@ -1551,7 +2117,7 @@ $events = @(
         Message  = 'Event Logs Cleared'
         Log      = '(System 104)'
         LogName  = 'System'
-        Registry = "$eventLog\Application"
+        Registry = "$eventLog\System"
         EventId  = 104
     },
     @{
@@ -1585,13 +2151,28 @@ $events = @(
 )
 
 foreach ($event in $events) {
-    $lastEventRecord = Get-WinEvent -LogName $event.LogName -FilterXPath "*[System[EventID=$($event.EventId)]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-    $lastEventText = if ($lastEventRecord) {
-        $lastEventRecord.TimeCreated.ToString($formatDate)
-    } else {
-        'No records found'
+    $lastEventRecord = $null
+    $eventReadError = $null
+    try {
+        $lastEventRecord = Get-WinEvent -LogName $event.LogName -FilterXPath "*[System[EventID=$($event.EventId)]]" -MaxEvents 1 -ErrorAction Stop
+    } catch {
+        $eventReadError = $_.Exception.Message
     }
-    $eventColor = if ($lastEventRecord) { $successColor } else { $warnColor }
+
+    if ($lastEventRecord) {
+        $lastEventText = $lastEventRecord.TimeCreated.ToString($formatDate)
+        $eventColor = $successColor
+    } elseif ($eventReadError -match '(?i)No events were found|No matching events') {
+        $lastEventText = 'No records found'
+        $eventColor = $subtColor
+    } elseif ($eventReadError -match '(?i)not found|does not exist|No such') {
+        $lastEventText = 'Log not found'
+        $eventColor = $warnColor
+    } else {
+        $lastEventText = 'UNKNOWN (read error)'
+        $eventColor = $warnColor
+        Add-ScanIssue 'Event logs' "No se pudo leer $($event.LogName) (ID $($event.EventId)): $eventReadError"
+    }
 
     $lastWrite = $null
     try {
@@ -1618,25 +2199,36 @@ if (Test-Path -LiteralPath $recyclePath) {
     $lastModified = $recycleRoot.LastWriteTime
     $totalItems = 0
     $lastItem = $null
+    $recycleError = $null
 
-    foreach ($sidFolder in @(Get-ChildItem -LiteralPath $recyclePath -Force -Directory -ErrorAction SilentlyContinue)) {
-        if ($sidFolder.LastWriteTime -gt $lastModified) { $lastModified = $sidFolder.LastWriteTime }
+    try {
+        foreach ($sidFolder in @(Get-ChildItem -LiteralPath $recyclePath -Force -Directory -ErrorAction Stop)) {
+            if ($sidFolder.LastWriteTime -gt $lastModified) { $lastModified = $sidFolder.LastWriteTime }
 
-        foreach ($item in @(Get-ChildItem -LiteralPath $sidFolder.FullName -Force -ErrorAction SilentlyContinue)) {
-            $totalItems++
-            if ($null -eq $lastItem -or $item.LastWriteTime -ge $lastItem.LastWriteTime) {
-                $lastItem = $item
+            foreach ($item in @(Get-ChildItem -LiteralPath $sidFolder.FullName -Force -ErrorAction Stop)) {
+                $totalItems++
+                if ($null -eq $lastItem -or $item.LastWriteTime -ge $lastItem.LastWriteTime) {
+                    $lastItem = $item
+                }
             }
         }
+    } catch {
+        $recycleError = $_.Exception.Message
+        Add-ScanIssue 'Recycle Bin' "No se pudo enumerar $recyclePath : $($_.Exception.Message)"
     }
 
-    $lastItemText = if ($lastItem) { $lastItem.Name } else { 'No items found' }
-
-    Write-Field 'Total Items:' $totalItems $fieldWidth $textColor $subtColor
-    Write-Field 'Last Deleted Item:' $lastItemText $fieldWidth $textColor $subtColor
-    Write-Field 'Modified Time:' $lastModified.ToString($formatDate) $fieldWidth $textColor $subtColor
+    if ($recycleError) {
+        Write-Field 'Total Items:' 'UNKNOWN (read error)' $fieldWidth $textColor $warnColor
+        Write-Field 'Last Deleted Item:' 'UNKNOWN (read error)' $fieldWidth $textColor $warnColor
+        Write-Field 'Modified Time:' $lastModified.ToString($formatDate) $fieldWidth $textColor $subtColor
+    } else {
+        $lastItemText = if ($lastItem) { $lastItem.Name } else { 'No items found' }
+        Write-Field 'Total Items:' $totalItems $fieldWidth $textColor $subtColor
+        Write-Field 'Last Deleted Item:' $lastItemText $fieldWidth $textColor $subtColor
+        Write-Field 'Modified Time:' $lastModified.ToString($formatDate) $fieldWidth $textColor $subtColor
+    }
 } else {
-    Write-Host ($infoIndex + "$recyclePath not found.") -ForegroundColor $dangerColor
+    Write-Host ($infoIndex + "$recyclePath not found.") -ForegroundColor $warnColor
 }
 
 Write-Host ''
@@ -1646,15 +2238,30 @@ try { $consoleHistPath = (Get-PSReadLineOption).HistorySavePath } catch {}
 
 if ($consoleHistPath -and (Test-Path -LiteralPath $consoleHistPath)) {
     $historyFile = Get-Item -LiteralPath $consoleHistPath -Force
-    $lastLine = Get-Content -LiteralPath $consoleHistPath -Last 1 -ErrorAction SilentlyContinue
+    $lastLine = $null
+    $historyError = $null
+    try {
+        $lastLine = Get-Content -LiteralPath $consoleHistPath -Last 1 -ErrorAction Stop
+    } catch {
+        $historyError = $_.Exception.Message
+        Add-ScanIssue 'Console history' "No se pudo leer $consoleHistPath : $($_.Exception.Message)"
+    }
     $attributes = $historyFile.Attributes
     $lastModified = $historyFile.LastWriteTime
 
     $status = if ($attributes -ne [IO.FileAttributes]::Archive) { $attributes.ToString() } else { 'Normal' }
-    $statusColor = if ($status -eq 'Normal') { $successColor } else { $dangerColor }
-    $lastCommand = if ($lastLine -eq '}') { 'ScriptBlock' } elseif ($lastLine) { $lastLine } else { '(empty)' }
+    $statusColor = if ($status -eq 'Normal') { $successColor } else { $warnColor }
+    if ($historyError) {
+        $lastCommand = 'UNKNOWN (read error)'
+    } elseif ($lastLine -eq '}') {
+        $lastCommand = 'ScriptBlock'
+    } elseif ($lastLine) {
+        $lastCommand = $lastLine
+    } else {
+        $lastCommand = '(empty)'
+    }
 
-    Write-Field 'Last Command:' $lastCommand $fieldWidth $textColor $subtColor
+    Write-Field 'Last Command:' $lastCommand $fieldWidth $textColor $(if ($historyError) { $warnColor } else { $subtColor })
     Write-Field 'File Attributes:' $status $fieldWidth $textColor $statusColor
     Write-Field 'Modified Time:' $lastModified.ToString($formatDate) $fieldWidth $textColor $subtColor
 } else {
@@ -1665,76 +2272,192 @@ Write-Host ''
 Write-SubSection 'Hosts'
 $hostsPath = Join-Path $env:SystemRoot 'System32\Drivers\etc\hosts'
 
+function Get-HostsLineClass {
+    param([string]$Line)
+
+    $clean = $Line
+    $commentIndex = $clean.IndexOf('#')
+    if ($commentIndex -ge 0) { $clean = $clean.Substring(0, $commentIndex) }
+    $clean = $clean.Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { return 'Malformed' }
+
+    $parts = @($clean -split '\s+' | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 2) { return 'Malformed' }
+
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip)) { return 'Malformed' }
+
+    $hostNames = @($parts[1..($parts.Count - 1)] | ForEach-Object { $_.ToLowerInvariant() })
+    $localNames = @(
+        'localhost', 'localhost.localdomain', 'local', 'broadcasthost',
+        'ip6-localhost', 'ip6-loopback', 'ip6-localnet', 'ip6-mcastprefix',
+        'ip6-allnodes', 'ip6-allrouters', 'ip6-allhosts'
+    )
+
+    $bytes = $ip.GetAddressBytes()
+    $isLoopbackOrUnspecified = $false
+    $isPrivate = $false
+
+    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        $isLoopbackOrUnspecified = ($bytes[0] -eq 127) -or ($bytes[0] -eq 0)
+        $isPrivate = ($bytes[0] -eq 10) -or
+                     ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
+                     ($bytes[0] -eq 192 -and $bytes[1] -eq 168) -or
+                     ($bytes[0] -eq 169 -and $bytes[1] -eq 254)
+    } else {
+        $isLoopbackOrUnspecified = [System.Net.IPAddress]::IsLoopback($ip) -or $ip.Equals([System.Net.IPAddress]::IPv6Any)
+        $isPrivate = $ip.IsIPv6LinkLocal -or $ip.IsIPv6SiteLocal
+    }
+
+    if ($isLoopbackOrUnspecified) {
+        $onlyLocalNames = $true
+        foreach ($hostName in $hostNames) {
+            if ($localNames -notcontains $hostName) { $onlyLocalNames = $false; break }
+        }
+        if ($onlyLocalNames) { return 'Benign' }
+        return 'Blocklist'
+    }
+
+    if ($isPrivate) { return 'LocalOverride' }
+    return 'Redirect'
+}
+
 if (Test-Path -LiteralPath $hostsPath) {
     $hostsFile = Get-Item -LiteralPath $hostsPath -Force
     $attributes = $hostsFile.Attributes
-    $attributeColor = if (Test-ArchiveAttribute $attributes) { $successColor } else { $dangerColor }
+    $attributeColor = if (Test-ArchiveAttribute $attributes) { $successColor } else { $warnColor }
     $lastModified = $hostsFile.LastWriteTime
-    $content = @(Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue)
-    $suspiciousLines = [Collections.Generic.List[string]]::new()
+    $content = @()
+    $hostsError = $null
+    try {
+        $content = @(Get-Content -LiteralPath $hostsPath -ErrorAction Stop)
+    } catch {
+        $hostsError = $_.Exception.Message
+        Add-ScanIssue 'Hosts file' "No se pudo leer $hostsPath : $($_.Exception.Message)"
+    }
+    $activeEntries = [Collections.Generic.List[string]]::new()
+    $benignCount = 0
+    $blocklistCount = 0
+    $localOverrideCount = 0
+    $redirects = [Collections.Generic.List[string]]::new()
+    $malformed = [Collections.Generic.List[string]]::new()
 
     foreach ($line in $content) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line.TrimStart().StartsWith('#')) { continue }
-        $suspiciousLines.Add($line.Trim())
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith('#')) { continue }
+
+        $activeEntries.Add($trimmed)
+
+        switch (Get-HostsLineClass -Line $trimmed) {
+            'Benign'        { $benignCount++ }
+            'Blocklist'     { $blocklistCount++ }
+            'LocalOverride' { $localOverrideCount++ }
+            'Redirect'      { $redirects.Add($trimmed) }
+            default         { $malformed.Add($trimmed) }
+        }
     }
 
     Write-Field 'File Attributes:' $attributes.ToString() $fieldWidth $textColor $attributeColor
     Write-Field 'Modified Time:' $lastModified.ToString($formatDate) $fieldWidth $textColor $subtColor
-    Write-Host ($infoIndex + 'Suspicious Lines:'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
+    Write-Host ($infoIndex + 'Active entries:'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
 
-    if ($suspiciousLines.Count -eq 0) {
-        Write-Host 'No suspicious lines found' -ForegroundColor $successColor
+    if ($hostsError) {
+        Write-Host 'UNKNOWN (read error)' -ForegroundColor $warnColor
+    } elseif ($activeEntries.Count -eq 0) {
+        Write-Host 'None (default hosts file)' -ForegroundColor $successColor
     } else {
-        Write-Host ("{0} found" -f $suspiciousLines.Count) -ForegroundColor $dangerColor
-        $maxShow = 3
+        $parts = @("$($activeEntries.Count) total")
+        if ($benignCount -gt 0) { $parts += "$benignCount local/default" }
+        if ($blocklistCount -gt 0) { $parts += "$blocklistCount blocklist" }
+        if ($localOverrideCount -gt 0) { $parts += "$localOverrideCount LAN override" }
+        if ($redirects.Count -gt 0) { $parts += "$($redirects.Count) public redirect" }
+        if ($malformed.Count -gt 0) { $parts += "$($malformed.Count) malformed" }
+        $entriesColor = if ($redirects.Count -gt 0 -or $malformed.Count -gt 0) { $warnColor } else { $textColor }
+        Write-Host ($parts -join ', ') -ForegroundColor $entriesColor
 
-        for ($i = 0; $i -lt [Math]::Min($maxShow, $suspiciousLines.Count); $i++) {
-            Write-Host ($infoIndex + '  |- ') -ForegroundColor $subtColor -NoNewline
-            Write-Host $suspiciousLines[$i] -ForegroundColor $dangerColor
+        if ($redirects.Count -gt 0) {
+            $maxShow = 3
+            for ($i = 0; $i -lt [Math]::Min($maxShow, $redirects.Count); $i++) {
+                Write-Host ($infoIndex + '  |- Public redirect: ') -ForegroundColor $subtColor -NoNewline
+                Write-Host $redirects[$i] -ForegroundColor $warnColor
+            }
+            if ($redirects.Count -gt $maxShow) {
+                Write-Host ($infoIndex + "  |- And $($redirects.Count - $maxShow) more public redirect(s)...") -ForegroundColor $subtColor
+            }
         }
-
-        if ($suspiciousLines.Count -gt $maxShow) {
-            Write-Host ($infoIndex + '  |- And ') -ForegroundColor $subtColor -NoNewline
-            Write-Host ($suspiciousLines.Count - $maxShow) -ForegroundColor $dangerColor -NoNewline
-            Write-Host ' more...' -ForegroundColor $subtColor
+        if ($malformed.Count -gt 0) {
+            for ($i = 0; $i -lt [Math]::Min(3, $malformed.Count); $i++) {
+                Write-Host ($infoIndex + '  |- Malformed: ') -ForegroundColor $subtColor -NoNewline
+                Write-Host $malformed[$i] -ForegroundColor $warnColor
+            }
         }
     }
 } else {
-    Write-Host ($infoIndex + "Hosts not found in '$hostsPath'") -ForegroundColor $dangerColor
+    Write-Host ($infoIndex + "Hosts not found in '$hostsPath'") -ForegroundColor $warnColor
 }
 
 Write-Host ''
 Write-SubSection 'USNJournal ($UsnJrnl:$J)'
 
 $usnUrl      = 'https://github.com/Orbdiff/CheckDeletedUSN/releases/download/v0.2.1/CheckDeletedUSN.exe'
-$usnExe      = Join-Path $env:TEMP 'CheckDeletedUSN.exe'
 $usnHash     = '3CC655225C8F9B829AD446E4390C5C738F8E3DDB560493A52EE269AA00AADF42'
-$usnInFile   = Join-Path $env:TEMP 'CheckDeletedUSN.input.txt'
-$usnOutFile  = Join-Path $env:TEMP 'CheckDeletedUSN.output.txt'
-$usnErrFile  = Join-Path $env:TEMP 'CheckDeletedUSN.error.txt'
+$usnRoot     = Join-Path $env:ProgramData 'PsicoChecker\tools\v0.2.1'
+$usnRunDir   = Join-Path $usnRoot ([guid]::NewGuid().ToString('N'))
+$usnExe      = Join-Path $usnRunDir 'CheckDeletedUSN.exe'
+$usnPartial  = $usnExe + '.partial'
+$usnInFile   = Join-Path $usnRunDir 'input.txt'
+$usnOutFile  = Join-Path $usnRunDir 'output.txt'
+$usnErrFile  = Join-Path $usnRunDir 'error.txt'
 $usnPath     = 'C:\$Extend\$UsnJrnl:$J'
 $usnCreated  = $null
 $usnState    = 'Unknown'
 $usnError    = $null
+$usnSignature = 'Not checked'
+$usnProcess  = $null
 
 try {
-    $needDownload = $true
-    if (Test-Path -LiteralPath $usnExe) {
-        $existingHash = Get-FileHash -LiteralPath $usnExe -Algorithm SHA256 -ErrorAction SilentlyContinue
-        if ($existingHash -and $existingHash.Hash -eq $usnHash) { $needDownload = $false }
+    $null = New-Item -ItemType Directory -Path $usnRunDir -Force -ErrorAction Stop
+
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    if (Test-Path -LiteralPath $icacls -PathType Leaf) {
+        $account = if ($env:USERDOMAIN) { "$($env:USERDOMAIN)\$($env:USERNAME)" } else { $env:USERNAME }
+        $aclOutput = & $icacls $usnRunDir /inheritance:r /grant:r "$($account):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Add-ScanIssue 'USNJournal' "No se pudieron restringir los permisos de $usnRunDir : $($aclOutput -join ' ')"
+        }
     }
 
-    if ($needDownload) {
-        Invoke-WebRequest -Uri $usnUrl -UseBasicParsing -OutFile $usnExe -ErrorAction Stop
-        $downloadedHash = Get-FileHash -LiteralPath $usnExe -Algorithm SHA256 -ErrorAction Stop
-        if ($downloadedHash.Hash -ne $usnHash) {
-            throw 'El archivo descargado no coincide con el hash esperado.'
-        }
+    Invoke-WebRequest -Uri $usnUrl -UseBasicParsing -OutFile $usnPartial -ErrorAction Stop
+
+    $downloadedHash = Get-FileHash -LiteralPath $usnPartial -Algorithm SHA256 -ErrorAction Stop
+    if ($downloadedHash.Hash -ne $usnHash) {
+        throw 'El archivo descargado no coincide con el hash esperado.'
+    }
+
+    Move-Item -LiteralPath $usnPartial -Destination $usnExe -Force -ErrorAction Stop
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $usnExe -ErrorAction Stop
+    $usnSignature = [string]$signature.Status
+    if ($signature.SignerCertificate) {
+        $usnSignature += ' / ' + [string]$signature.SignerCertificate.Subject
+    }
+
+    if ($signature.Status -notin @('Valid', 'NotSigned')) {
+        throw "Firma Authenticode no valida: $($signature.Status)"
     }
 
     Remove-Item -LiteralPath $usnOutFile, $usnErrFile -Force -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($usnInFile, "`r`n")
+
+    # Re-verify immediately before execution (TOCTOU window reduction).
+    $finalHash = Get-FileHash -LiteralPath $usnExe -Algorithm SHA256 -ErrorAction Stop
+    if ($finalHash.Hash -ne $usnHash) {
+        throw 'El ejecutable cambio entre la verificacion y la ejecucion.'
+    }
+    if (-not (Test-Path -LiteralPath $usnExe -PathType Leaf)) {
+        throw 'El ejecutable desaparecio antes de la ejecucion.'
+    }
 
     $usnProcess = Start-Process -FilePath $usnExe `
         -RedirectStandardInput $usnInFile `
@@ -1768,11 +2491,14 @@ try {
     } elseif ($usnRaw -match '(?i)Failed to enable SeDebugPrivilege') {
         $usnState = 'Access denied (SeDebugPrivilege)'
     }
-
-    Remove-Item -LiteralPath $usnOutFile, $usnErrFile, $usnInFile -Force -ErrorAction SilentlyContinue
 } catch {
     $usnError = $_.Exception.Message
-    Remove-Item -LiteralPath $usnOutFile, $usnErrFile, $usnInFile -Force -ErrorAction SilentlyContinue
+    Add-ScanIssue 'USNJournal' "CheckDeletedUSN fallo: $($_.Exception.Message)"
+} finally {
+    if ($usnProcess -and -not $usnProcess.HasExited) {
+        try { $usnProcess.Kill() } catch {}
+    }
+    Remove-Item -LiteralPath $usnRunDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 if ($usnError) {
@@ -1781,7 +2507,7 @@ if ($usnError) {
 } else {
     $stateColor = if ($usnState -eq 'Intact') {
         $successColor
-    } elseif ($usnState -like 'Deleted*' -or $usnState -like 'Access denied*') {
+    } elseif ($usnState -like 'Deleted*') {
         $dangerColor
     } else {
         $warnColor
@@ -1791,6 +2517,12 @@ if ($usnError) {
     Write-Field 'File Path:' $usnPath $fieldWidth $textColor $subtColor
     Write-Field 'Created:' $usnCreatedText $fieldWidth $textColor $subtColor
     Write-Field 'State:' $usnState $fieldWidth $textColor $stateColor
+    $signatureColor = if ($usnSignature -eq 'Valid' -or $usnSignature -like 'Valid / *') {
+        $successColor
+    } else {
+        $warnColor
+    }
+    Write-Field 'Signature:' $usnSignature $fieldWidth $textColor $signatureColor
 }
 
 Write-Host ''
@@ -1799,18 +2531,27 @@ $tmp = $env:TEMP
 
 if (Test-Path -LiteralPath $tmp) {
     $javaLauncherPath = Join-Path $tmp 'JavaLauncher.log'
-    $javaLauncher = Get-Item -LiteralPath $javaLauncherPath -Force -ErrorAction SilentlyContinue
+    $javaLauncherStatus = Get-PathEvidence $javaLauncherPath
+    $javaLauncher = $null
+    if ($javaLauncherStatus -eq 'Present') {
+        try { $javaLauncher = Get-Item -LiteralPath $javaLauncherPath -Force -ErrorAction Stop } catch { $javaLauncherStatus = 'Access denied' }
+    }
 
     Write-Host ($infoIndex + 'JavaLauncher:'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
-    if ($javaLauncher) {
+    if ($javaLauncherStatus -eq 'Access denied') {
+        Write-Host 'UNKNOWN (access denied)' -ForegroundColor $warnColor
+        Add-ScanIssue 'TEMP' "Acceso denegado a $javaLauncherPath"
+    } elseif ($javaLauncher) {
         Write-Host 'JavaLauncher.log found' -ForegroundColor $subtColor
 
         $attributes = $javaLauncher.Attributes
-        $attributeColor = if (Test-ArchiveAttribute $attributes) { $successColor } else { $dangerColor }
+        $attributeColor = if (Test-ArchiveAttribute $attributes) { $successColor } else { $warnColor }
         Write-Field 'File Attributes:' $attributes.ToString() $fieldWidth $textColor $attributeColor
 
         $executions = @(Get-JavaLauncherExecutions -Path $javaLauncher.FullName)
-        if ($executions.Count -gt 0) {
+        if ($script:JavaLauncherReadError) {
+            Write-Field 'java -jar:' 'UNKNOWN (read error)' $fieldWidth $textColor $warnColor
+        } elseif ($executions.Count -gt 0) {
             $javaJarCount = @($executions | Where-Object { $_.JavaJar }).Count
             $javaJarText = if ($javaJarCount -gt 0) { "Yes ($javaJarCount)" } else { 'Not detected' }
             $javaJarColor = if ($javaJarCount -gt 0) { $successColor } else { $warnColor }
@@ -1823,7 +2564,7 @@ if (Test-Path -LiteralPath $tmp) {
                 $counter++
                 $dateText = if ($execution.Date) { $execution.Date.ToString($formatDate) } else { 'Unknown' }
                 Write-Host ($infoIndex + "  $counter. $dateText : ") -ForegroundColor $subtColor -NoNewline
-                Write-Host $execution.Jar -ForegroundColor $warnColor
+                Write-Host $execution.Jar -ForegroundColor $textColor
                 Write-Host ($infoIndex + '     |- java -jar: ') -ForegroundColor $subtColor -NoNewline
 
                 if ($execution.JavaJar) {
@@ -1840,10 +2581,19 @@ if (Test-Path -LiteralPath $tmp) {
     }
 
     Write-Host ''
-    $jnativeHook = @(Get-ChildItem -LiteralPath $tmp -Filter 'JNativeHook*' -Force -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    $jnativeHook = @()
+    $jnativeError = $null
+    try {
+        $jnativeHook = @(Get-ChildItem -LiteralPath $tmp -Filter 'JNativeHook*' -Force -File -ErrorAction Stop | Sort-Object LastWriteTime)
+    } catch {
+        $jnativeError = $_.Exception.Message
+        Add-ScanIssue 'TEMP' "No se pudo enumerar JNativeHook en $tmp : $($_.Exception.Message)"
+    }
     Write-Host ($infoIndex + 'JNativeHook:'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
 
-    if ($jnativeHook.Count -gt 0) {
+    if ($jnativeError) {
+        Write-Host 'UNKNOWN (read error)' -ForegroundColor $warnColor
+    } elseif ($jnativeHook.Count -gt 0) {
         Write-Host 'JNativeHook files found' -ForegroundColor $subtColor
         $counter = 0
 
@@ -1857,7 +2607,7 @@ if (Test-Path -LiteralPath $tmp) {
         Write-Host 'No JNativeHook files found' -ForegroundColor $successColor
     }
 } else {
-    Write-Host ($infoIndex + "$tmp not found.") -ForegroundColor $dangerColor
+    Write-Host ($infoIndex + "$tmp not found.") -ForegroundColor $warnColor
 }
 
 # --- PREFETCH INTEGRITY -------------------------------------------------------
@@ -1867,14 +2617,34 @@ $prefetchPath = Join-Path $env:SystemRoot 'Prefetch'
 $prefetchFindings = [Collections.Generic.List[object]]::new()
 $duplicatedHashes = @()
 $prefetchStatus = 'Not found'
-$prefetchColor = $dangerColor
+$prefetchColor = $warnColor
 $prefetchCount = 0
 $loggedCount = 0
 $readOnlyCount = 0
+$hiddenCount = 0
+$unreadableCount = 0
+$unexpectedHeaderCount = 0
 $deletedPrefetch = $null
+$prefetchDisabled = $false
+$recreatedAfterBoot = $false
+$recreatedText = 'No'
+$recreatedColor = $textColor
 
-if (Test-Path -LiteralPath $prefetchPath) {
-    $prefetchFiles = @(Get-ChildItem -LiteralPath $prefetchPath -Filter '*.pf' -Force -File -ErrorAction SilentlyContinue)
+$prefetchPolicy = Get-RegistryEvidence -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name 'EnablePrefetcher'
+if ($prefetchPolicy.Status -eq 'Present' -and $null -ne $prefetchPolicy.Value -and [int]$prefetchPolicy.Value -eq 0) {
+    $prefetchDisabled = $true
+}
+
+$prefetchFolderStatus = Get-PathEvidence $prefetchPath
+if ($prefetchFolderStatus -eq 'Present') {
+    $prefetchFiles = @()
+    $prefetchReadError = $null
+    try {
+        $prefetchFiles = @(Get-ChildItem -LiteralPath $prefetchPath -Filter '*.pf' -Force -File -ErrorAction Stop)
+    } catch {
+        $prefetchReadError = $_.Exception.Message
+        Add-ScanIssue 'Prefetch Integrity' "No se pudo enumerar $prefetchPath : $($_.Exception.Message)"
+    }
     $prefetchCount = $prefetchFiles.Count
     $hashTable = @{}
 
@@ -1883,36 +2653,43 @@ if (Test-Path -LiteralPath $prefetchPath) {
         $isReadOnly = $file.IsReadOnly
 
         if ($isReadOnly) { $readOnlyCount++ }
+        if ($isHidden) { $hiddenCount++ }
 
+        # Attributes are observations only, never proof of tampering.
         if ($isReadOnly -and $isHidden) {
-            $prefetchFindings.Add([pscustomobject]@{ Type = 'Read-Only and Hidden file'; File = $file.Name })
+            $prefetchFindings.Add([pscustomobject]@{ Type = 'Read-only and hidden attribute'; File = $file.Name; Severity = 'Info' })
         } elseif ($isReadOnly) {
-            $prefetchFindings.Add([pscustomobject]@{ Type = 'Read-Only file'; File = $file.Name })
+            $prefetchFindings.Add([pscustomobject]@{ Type = 'Read-only attribute'; File = $file.Name; Severity = 'Info' })
         } elseif ($isHidden) {
-            $prefetchFindings.Add([pscustomobject]@{ Type = 'Hidden file'; File = $file.Name })
-        } else {
-            $readOk = $false
-            $mam = ''
+            $prefetchFindings.Add([pscustomobject]@{ Type = 'Hidden attribute'; File = $file.Name; Severity = 'Info' })
+        }
 
+        $header = ''
+        $readOk = $false
+        try {
+            $buffer = New-Object byte[] 4
+            $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
             try {
-                $buffer = New-Object byte[] 3
-                $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-                try {
-                    $bytesRead = $stream.Read($buffer, 0, 3)
-                } finally {
-                    $stream.Dispose()
-                }
-                $readOk = $true
-                $mam = [Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead)
-            } catch {}
-
-            if (-not $readOk) {
-                $prefetchFindings.Add([pscustomobject]@{ Type = 'Could not read file'; File = $file.Name })
-            } elseif ($mam -ne 'MAM') {
-                $prefetchFindings.Add([pscustomobject]@{ Type = "Does not contain 'MAM'"; File = $file.Name })
-            } else {
-                $loggedCount++
+                $bytesRead = $stream.Read($buffer, 0, 4)
+            } finally {
+                $stream.Dispose()
             }
+            $readOk = $true
+            if ($bytesRead -gt 0) { $header = [Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead) }
+        } catch {}
+
+        $validHeader = $header.StartsWith('MAM', [StringComparison]::OrdinalIgnoreCase) -or
+                       $header.StartsWith('SCCA', [StringComparison]::OrdinalIgnoreCase)
+
+        if (-not $readOk) {
+            $unreadableCount++
+            $prefetchFindings.Add([pscustomobject]@{ Type = 'Could not read header'; File = $file.Name; Severity = 'Review' })
+        } elseif ($validHeader) {
+            $loggedCount++
+        } else {
+            $unexpectedHeaderCount++
+            $headerText = if ([string]::IsNullOrWhiteSpace($header)) { '(empty)' } else { $header.Trim([char[]]@([char]0)) }
+            $prefetchFindings.Add([pscustomobject]@{ Type = "Unexpected header '$headerText' (expected MAM/SCCA)"; File = $file.Name; Severity = 'Review' })
         }
 
         $hash = $null
@@ -1921,7 +2698,7 @@ if (Test-Path -LiteralPath $prefetchPath) {
         } catch {}
 
         if (-not $hash) {
-            $prefetchFindings.Add([pscustomobject]@{ Type = 'Could not calculate SHA256'; File = $file.Name })
+            $prefetchFindings.Add([pscustomobject]@{ Type = 'Could not calculate SHA256'; File = $file.Name; Severity = 'Review' })
             $hash = "UNREADABLE:$($file.Name)"
         }
 
@@ -1935,58 +2712,134 @@ if (Test-Path -LiteralPath $prefetchPath) {
 
     $duplicatedHashes = @($hashTable.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 })
 
-    if ($prefetchFindings.Count -eq 0 -and $duplicatedHashes.Count -eq 0) {
+    if ($prefetchReadError) {
+        $prefetchStatus = 'Unknown (read error)'
+        $prefetchColor = $warnColor
+    } elseif ($prefetchCount -eq 0) {
+        if ($prefetchDisabled) {
+            $prefetchStatus = 'Empty (prefetch disabled)'
+            $prefetchColor = $textColor
+        } else {
+            $prefetchStatus = 'Empty / Review'
+            $prefetchColor = $warnColor
+        }
+    } elseif ($unreadableCount -gt 0 -or $unexpectedHeaderCount -gt 0) {
+        $prefetchStatus = 'Review'
+        $prefetchColor = $warnColor
+    } else {
         $prefetchStatus = 'Clean'
         $prefetchColor = $successColor
-    } else {
-        $prefetchStatus = 'Suspicious'
-        $prefetchColor = $warnColor
     }
 
     $deletedPrefetch = Get-DeletedPrefetchCount -Volume $env:SystemDrive
+
+    try {
+        $folderInfo = Get-Item -LiteralPath $prefetchPath -Force -ErrorAction Stop
+        if ($bootTime -and $folderInfo.CreationTime -gt $bootTime) {
+            $recreatedAfterBoot = $true
+            $usnNote = ''
+            if ($deletedPrefetch -and $deletedPrefetch.Status -eq 'OK') {
+                $usnNote = "; USN deletions: $($deletedPrefetch.Events)"
+            }
+            $recreatedText = 'Yes (' + $folderInfo.CreationTime.ToString($formatDate) + $usnNote + ')'
+            $recreatedColor = $warnColor
+            $prefetchFindings.Add([pscustomobject]@{
+                Type     = 'Prefetch folder created after boot'
+                File     = $folderInfo.CreationTime.ToString($formatDate)
+                Severity = 'Review'
+            })
+            if ($prefetchStatus -eq 'Clean') {
+                $prefetchStatus = 'Review'
+                $prefetchColor = $warnColor
+            }
+        }
+    } catch {}
+} elseif ($prefetchFolderStatus -eq 'Access denied') {
+    $prefetchStatus = 'Unknown (access denied)'
+    $prefetchColor = $warnColor
+    Add-ScanIssue 'Prefetch Integrity' "Acceso denegado a $prefetchPath"
+} else {
+    $prefetchStatus = if ($prefetchDisabled) { 'Not found (prefetch disabled)' } else { 'Not found' }
+    $prefetchColor = if ($prefetchDisabled) { $textColor } else { $warnColor }
 }
 
 Write-Host ($titleIndex + 'Prefetch status:'.PadRight($fieldWidth) + $prefetchStatus) -ForegroundColor $prefetchColor
 
-if ($prefetchStatus -eq 'Not found') {
+if ($prefetchStatus -like 'Not found*') {
     Write-Host ($infoIndex + "Path: $prefetchPath") -ForegroundColor $subtColor
 } else {
     $deletedText = 'N/A'
     $deletedColor = $subtColor
+    $deletedFilesText = 'N/A'
+    $deletedFilesColor = $subtColor
+    $usnStatusText = 'Unavailable'
+    $usnStatusColor = $warnColor
 
     if ($deletedPrefetch) {
         if ($deletedPrefetch.Status -eq 'OK') {
-            $deletedText = [string]$deletedPrefetch.Count
-            $deletedColor = if ($deletedPrefetch.Count -gt 0) { $warnColor } else { $successColor }
-        } elseif ($deletedPrefetch.Status -eq 'Partial (timeout)') {
-            $deletedText = [string]$deletedPrefetch.Count + ' (partial)'
+            $deletedText = [string]$deletedPrefetch.Events
+            $deletedColor = $textColor
+            $deletedFilesText = [string]$deletedPrefetch.Files
+            $deletedFilesColor = $textColor
+            $usnStatusText = 'OK'
+            $usnStatusColor = $successColor
+        } else {
+            $deletedText = 'UNKNOWN'
             $deletedColor = $warnColor
+            $deletedFilesText = 'UNKNOWN'
+            $deletedFilesColor = $warnColor
+            $usnStatusText = $deletedPrefetch.Status
+            $usnStatusColor = $warnColor
         }
     }
 
-    $readOnlyColor = if ($readOnlyCount -eq 0) { $successColor } else { $dangerColor }
-    $loggedColor = if ($loggedCount -gt 0) { $successColor } else { $warnColor }
+    $loggedColor = if ($loggedCount -gt 0) { $textColor } elseif ($prefetchCount -gt 0) { $warnColor } else { $textColor }
 
-    Write-Field 'Prefetch files:' ([string]$prefetchCount) $fieldWidth $textColor $textColor
-    Write-Field 'Logged (MAM valid):' ([string]$loggedCount) $fieldWidth $textColor $loggedColor
-    Write-Field 'Read-only:' ([string]$readOnlyCount) $fieldWidth $textColor $readOnlyColor
-    Write-Field 'Deleted (USN):' $deletedText $fieldWidth $textColor $deletedColor
+    if ($prefetchStatus -like 'Unknown*') {
+        $prefetchFilesText = 'UNKNOWN'
+        $loggedText = 'UNKNOWN'
+        $readOnlyText = 'UNKNOWN'
+        $hiddenText = 'UNKNOWN'
+        $prefetchFilesColor = $warnColor
+        $loggedColor = $warnColor
+        $readOnlyColor = $warnColor
+    } else {
+        $prefetchFilesText = [string]$prefetchCount
+        $loggedText = [string]$loggedCount
+        $readOnlyText = [string]$readOnlyCount
+        $hiddenText = [string]$hiddenCount
+        $prefetchFilesColor = $textColor
+        $readOnlyColor = $textColor
+    }
+
+    Write-Field 'Prefetch files:' $prefetchFilesText $fieldWidth $textColor $prefetchFilesColor
+    Write-Field 'Logged (MAM/SCCA):' $loggedText $fieldWidth $textColor $loggedColor
+    Write-Field 'Read-only:' $readOnlyText $fieldWidth $textColor $readOnlyColor
+    Write-Field 'Hidden:' $hiddenText $fieldWidth $textColor $textColor
+    Write-Field 'Recreated after boot:' $recreatedText $fieldWidth $textColor $recreatedColor
+    Write-Field 'Deleted events (USN):' $deletedText $fieldWidth $textColor $deletedColor
+    Write-Field 'Deleted unique files:' $deletedFilesText $fieldWidth $textColor $deletedFilesColor
+    Write-Field 'USN read status:' $usnStatusText $fieldWidth $textColor $usnStatusColor
+    if ($deletedPrefetch -and $deletedPrefetch.Detail -and $deletedPrefetch.Status -ne 'OK') {
+        Write-Host ($infoIndex + '  |- ' + $deletedPrefetch.Detail) -ForegroundColor $warnColor
+    }
     Write-Host ''
 
     foreach ($finding in $prefetchFindings) {
+        $findingColor = if ($finding.Severity -eq 'Review') { $warnColor } else { $subtColor }
         Write-Int $infoIndex '-' $finding.Type
         Write-Host ($infoIndex + '  |- File: ') -ForegroundColor $subtColor -NoNewline
-        Write-Host $finding.File -ForegroundColor $dangerColor
+        Write-Host $finding.File -ForegroundColor $findingColor
     }
 
     foreach ($group in $duplicatedHashes) {
-        Write-Int $infoIndex '-' 'Duplicated hash'
+        Write-Int $infoIndex '-' 'Duplicated hash (observation)'
         Write-Host ($infoIndex + '  |- Files: ') -ForegroundColor $subtColor -NoNewline
 
         $groupFiles = @($group.Value)
         for ($i = 0; $i -lt $groupFiles.Count; $i++) {
             if ($i -gt 0) { Write-Host ', ' -ForegroundColor $subtColor -NoNewline }
-            Write-Host $groupFiles[$i] -ForegroundColor $dangerColor -NoNewline
+            Write-Host $groupFiles[$i] -ForegroundColor $subtColor -NoNewline
         }
 
         Write-Host ''
@@ -2006,8 +2859,44 @@ $registryItems = @(
 )
 
 foreach ($item in $registryItems) {
-    $itemProperty = Get-ItemProperty -LiteralPath $item.Path -Name $item.Key -ErrorAction SilentlyContinue
+    $evidence = Get-RegistryEvidence -Path $item.Path -Name $item.Key
     $itemColor = $successColor
+    $status = ''
+    $statusColor = $textColor
+
+    switch ($evidence.Status) {
+        'Present' {
+            $value = $evidence.Value
+            if ($null -eq $value) {
+                $status = 'Not set'
+                $statusColor = $textColor
+            } elseif ($value -eq $item.Disabled) {
+                $status = 'Disabled'
+                $statusColor = $warnColor
+            } else {
+                $status = if ($item.Name -ne 'Command Prompt') { 'Enabled' } else { 'Available' }
+                $statusColor = $successColor
+            }
+        }
+        'Value missing' {
+            $status = 'Not configured'
+            $statusColor = $textColor
+        }
+        'Key missing' {
+            $status = 'Key missing'
+            $statusColor = $textColor
+        }
+        'Access denied' {
+            $status = 'UNKNOWN (access denied)'
+            $statusColor = $warnColor
+            Add-ScanIssue 'Registry' "Acceso denegado a $($item.Path) -> $($item.Key)"
+        }
+        default {
+            $status = 'UNKNOWN (read error)'
+            $statusColor = $warnColor
+            Add-ScanIssue 'Registry' "No se pudo leer $($item.Path) -> $($item.Key): $($evidence.Error)"
+        }
+    }
 
     $hive = [PsicoRegUtil]::HKEY_LOCAL_MACHINE
     $relativePath = ''
@@ -2030,55 +2919,172 @@ foreach ($item in $registryItems) {
         'Unknown'
     }
 
-    $value = $itemProperty.$($item.Key)
-    if ($null -ne $value -and $value -eq $item.Disabled) {
-        $status = 'Disabled'
-        $itemColor = $dangerColor
-    } else {
-        $status = if ($item.Name -ne 'Command Prompt') { 'Enabled' } else { 'Available' }
-    }
-
     Write-Host ($infoIndex + $item.Name.PadRight($regNameWidth) + ' ') -ForegroundColor $textColor -NoNewline
-    Write-Host ($status.PadRight(10)) -ForegroundColor $itemColor -NoNewline
+    Write-Host ($status.PadRight(24)) -ForegroundColor $statusColor -NoNewline
     Write-Host $lastWriteText -ForegroundColor $subtColor
 }
 
 $ifeoPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
 $debuggers = [Collections.Generic.List[object]]::new()
 $deniedKeys = [Collections.Generic.List[string]]::new()
+$ifeoStatus = Get-PathEvidence $ifeoPath
+$ifeoEnumerationError = $null
+$ifeoMissing = $false
 
-if (Test-Path -LiteralPath $ifeoPath) {
-    foreach ($key in @(Get-ChildItem -LiteralPath $ifeoPath -ErrorAction SilentlyContinue)) {
+function Get-DebuggerAssessment {
+    param(
+        [string]$Debugger,
+        [string]$KeyName
+    )
+
+    $result = [pscustomobject]@{
+        Target    = $Debugger
+        Path      = $null
+        Evidence  = 'Unknown'
+        Signature = 'Unknown'
+        Signer    = $null
+        Verdict   = 'Review'
+        Color     = $warnColor
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Debugger)) {
+        $result.Evidence = 'Not set'
+        return $result
+    }
+
+    # IFEO Debugger == executable name is a compatibility shim, not a hijack.
+    # It is still listed and verified; it is never hidden.
+    $debuggerBase = [IO.Path]::GetFileNameWithoutExtension($Debugger.Trim('"', "'"))
+    $keyBase = [IO.Path]::GetFileNameWithoutExtension($KeyName)
+    $isSelfReference = ($debuggerBase -and $keyBase -and ($debuggerBase -ieq $keyBase))
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Debugger.Trim())
+    $target = $expanded
+    if ($target -match '^"([^"]+)"') {
+        $target = $Matches[1]
+    } elseif ($target -match '^(.+?\.(?:exe|com|bat|cmd))(?:\s|$)') {
+        $target = $Matches[1]
+    }
+
+    if (-not [IO.Path]::IsPathRooted($target)) {
+        $candidates = @(
+            (Join-Path $env:SystemRoot $target),
+            (Join-Path $env:SystemRoot (Join-Path 'System32' $target)),
+            (Join-Path $env:ProgramFiles $target)
+        )
+        $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+        if ($found) { $target = $found }
+    }
+
+    $result.Path = $target
+    $evidence = Get-PathEvidence $target
+    $result.Evidence = $evidence
+    if ($evidence -ne 'Present') {
+        $result.Verdict = 'Debugger target missing'
+        $result.Color = $warnColor
+        return $result
+    }
+
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $target -ErrorAction Stop
+        $result.Signature = [string]$sig.Status
+        if ($sig.SignerCertificate) { $result.Signer = [string]$sig.SignerCertificate.Subject }
+    } catch {
+        $result.Signature = 'Unknown'
+    }
+
+    if ($isSelfReference) {
+        $result.Verdict = 'Self-reference (no hijack)'
+        $result.Color = $textColor
+        return $result
+    }
+
+    $signedByMicrosoft = ($result.Signer -match '(?i)Microsoft')
+    if ($result.Signature -eq 'Valid' -and $signedByMicrosoft) {
+        $result.Verdict = 'Microsoft-signed'
+        $result.Color = $textColor
+    } elseif ($result.Signature -eq 'Valid') {
+        $result.Verdict = 'Third-party signed'
+        $result.Color = $warnColor
+    } else {
+        $result.Verdict = 'Unsigned/invalid signature'
+        $result.Color = $dangerColor
+    }
+
+    return $result
+}
+
+if ($ifeoStatus -eq 'Present') {
+    $ifeoKeys = @()
+    try {
+        $ifeoKeys = @(Get-ChildItem -LiteralPath $ifeoPath -ErrorAction Stop)
+    } catch {
+        $message = [string]$_.Exception.Message
+        if ($_.Exception -is [System.Security.SecurityException] -or $message -match '(?i)denied|unauthorized|not allowed') {
+            $ifeoEnumerationError = 'access denied'
+            Add-ScanIssue 'IFEO' "Acceso denegado a $ifeoPath"
+        } else {
+            $ifeoEnumerationError = $message
+            Add-ScanIssue 'IFEO' "No se pudo enumerar $ifeoPath : $message"
+        }
+    }
+
+    foreach ($key in $ifeoKeys) {
         try {
             $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
             if ($properties.Debugger) {
+                $assessment = Get-DebuggerAssessment -Debugger ([string]$properties.Debugger) -KeyName $key.PSChildName
                 $debuggers.Add([pscustomobject]@{
-                    Key      = $key.PSChildName
-                    Debugger = $properties.Debugger
+                    Key        = $key.PSChildName
+                    Debugger   = [string]$properties.Debugger
+                    Assessment = $assessment
                 })
             }
         } catch {
             $deniedKeys.Add($key.PSChildName)
+            Add-ScanIssue 'IFEO' "No se pudo leer la clave $($key.PSChildName): $($_.Exception.Message)"
         }
     }
+} elseif ($ifeoStatus -eq 'Access denied') {
+    $ifeoEnumerationError = 'access denied'
+    Add-ScanIssue 'IFEO' "Acceso denegado a $ifeoPath"
+} elseif ($ifeoStatus -eq 'Missing') {
+    $ifeoMissing = $true
 } else {
-    $deniedKeys.Add('Image File Execution Options (not found)')
+    $ifeoEnumerationError = $ifeoStatus
 }
 
 Write-Host ($infoIndex + 'Debuggers (IFEO):'.PadRight($fieldWidth)) -ForegroundColor $textColor -NoNewline
-if ($debuggers.Count -eq 0) {
-    Write-Host 'Not found' -ForegroundColor $successColor
+if ($ifeoEnumerationError) {
+    $ifeoStatusText = if ($ifeoEnumerationError -eq 'access denied') { 'UNKNOWN (access denied)' } else { 'UNKNOWN (read error)' }
+    Write-Host $ifeoStatusText -ForegroundColor $warnColor
+} elseif ($ifeoMissing) {
+    Write-Host 'Not present' -ForegroundColor $textColor
+} elseif ($debuggers.Count -eq 0) {
+    if ($deniedKeys.Count -gt 0) {
+        Write-Host 'UNKNOWN (some keys unreadable)' -ForegroundColor $warnColor
+    } else {
+        Write-Host 'Not found' -ForegroundColor $successColor
+    }
 } else {
-    Write-Host ("{0} found" -f $debuggers.Count) -ForegroundColor $dangerColor
+    # Every IFEO Debugger entry is listed; nothing is suppressed by allowlist.
+    $hasUnsigned = @($debuggers | Where-Object { $_.Assessment.Verdict -eq 'Unsigned/invalid signature' }).Count -gt 0
+    $hasMissing = @($debuggers | Where-Object { $_.Assessment.Verdict -eq 'Debugger target missing' }).Count -gt 0
+    $summaryColor = if ($hasUnsigned) { $dangerColor } elseif ($hasMissing) { $warnColor } else { $textColor }
+    Write-Host ("{0} found" -f $debuggers.Count) -ForegroundColor $summaryColor
     $counter = 0
 
     foreach ($debugger in $debuggers) {
         $counter++
         Write-Int $infoIndex $counter 'Debugger found'
         Write-Host ($infoIndex + '  |- Executable: ') -ForegroundColor $subtColor -NoNewline
-        Write-Host $debugger.Key -ForegroundColor $warnColor
+        Write-Host $debugger.Key -ForegroundColor $textColor
         Write-Host ($infoIndex + '  |- Debugger:   ') -ForegroundColor $subtColor -NoNewline
-        Write-Host $debugger.Debugger -ForegroundColor $warnColor
+        Write-Host $debugger.Debugger -ForegroundColor $debugger.Assessment.Color
+        Write-Host ($infoIndex + '  |- Target:     ') -ForegroundColor $subtColor -NoNewline
+        Write-Host ($(if ($debugger.Assessment.Path) { $debugger.Assessment.Path } else { 'Unknown' })) -ForegroundColor $subtColor
+        Write-Host ($infoIndex + '  |- Verified:   ') -ForegroundColor $subtColor -NoNewline
+        Write-Host ("$($debugger.Assessment.Verdict) (signature: $($debugger.Assessment.Signature), path: $($debugger.Assessment.Evidence))") -ForegroundColor $debugger.Assessment.Color
     }
 }
 
@@ -2092,6 +3098,63 @@ if ($deniedKeys.Count -gt 0) {
 # --- SCREEN CAPTURE PROCESSES -------------------------------------------------
 Write-SectionHeader 'SCREEN CAPTURE PROCESSES'
 
+function ConvertTo-LocalFilePath {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $path = $Value.Trim().Trim('"').Trim("'")
+
+    if ($path -match '^(?i)file:///(.+)$') {
+        $path = $Matches[1]
+        try { $path = [Uri]::UnescapeDataString($path) } catch {}
+        if ($path -match '^/[A-Za-z]:/') { $path = $path.Substring(1) }
+    }
+
+    $path = $path -replace '/', '\'
+    if ($path -match '^[A-Za-z]:\\') { return $path }
+    return $null
+}
+
+function Get-HtmlApiEvidence {
+    param([string]$Path)
+
+    $result = [pscustomobject]@{
+        Read    = $false
+        Strong  = $false
+        Matches = @()
+        Error   = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $result }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $result }
+
+    $stream = $null
+    try {
+        $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($file.Length -le 0 -or $file.Length -gt 5MB) { return $result }
+
+        $buffer = New-Object byte[] 262144
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { return $result }
+
+        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        $pattern = '(?i)(getDisplayMedia|MediaRecorder|desktopCapturer|RecordRTC|tabCapture|screencast|grabador de pantalla|grabaci[oó]n de pantalla)'
+        $apiMatches = [regex]::Matches($text, $pattern)
+        $names = @($apiMatches | ForEach-Object { $_.Value } | Sort-Object -Unique)
+
+        $result.Read = $true
+        $result.Matches = $names
+        $result.Strong = ($names.Count -gt 0)
+    } catch {
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+
+    return $result
+}
+
 function Get-BrowserRecorderFindings {
     $findings = [Collections.Generic.List[object]]::new()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -2100,8 +3163,6 @@ function Get-BrowserRecorderFindings {
         'browser','waterfox','librewolf','palemoon','tor','torbrowser',
         'chromium','epicbrowser','slimjet','comodo','msedgewebview2','electron'
     )
-    $recorderPattern = '(?i)(screen[\s_.-]?record|record(er|ing)?|captur|captura|grabaci[oó]n|screencast|desktopcapture|tabcapture|getdisplaymedia|obs[\s_.-]?(studio|project)?)'
-    $strongRecorderPattern = '(?i)(screen[\s_.-]?record|screen[\s_.-]?captur|screencast|grabador|captura de pantalla|recorder|desktopcapture|tabcapture|getdisplaymedia)'
 
     foreach ($proc in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
         try {
@@ -2111,39 +3172,31 @@ function Get-BrowserRecorderFindings {
             if ($browserNames -notcontains $baseName) { continue }
 
             $commandLine = [string]$proc.CommandLine
-            $title = ''
-            try {
-                $liveProc = Get-Process -Id $proc.ProcessId -ErrorAction Stop
-                $title = [string]$liveProc.MainWindowTitle
-            } catch {}
 
-            $url = ''
+            $candidatePath = $null
+            $candidateUrl = ''
             $appMatch = [regex]::Match($commandLine, '(?i)--app(?:=|\s+)(?:"(?<u>[^"]+)"|''(?<u>[^'']+)''|(?<u>\S+))')
-            if ($appMatch.Success) { $url = $appMatch.Groups['u'].Value.Trim() }
+            if ($appMatch.Success) { $candidateUrl = $appMatch.Groups['u'].Value.Trim() }
 
-            if (-not $url) {
+            if (-not $candidateUrl) {
                 $htmlMatch = [regex]::Match($commandLine, '(?i)(?<u>(?:[a-z]:\\|file:///|https?://)[^\s"'']+\.html?)')
-                if ($htmlMatch.Success) { $url = $htmlMatch.Groups['u'].Value }
+                if ($htmlMatch.Success) { $candidateUrl = $htmlMatch.Groups['u'].Value }
             }
 
-            $hasHtml = ($commandLine -match '(?i)\.(html?|htm)($|["''\s?])') -or ($url -match '(?i)\.(html?|htm)($|\?|#)')
-            $isHeadless = $commandLine -match '(?i)--headless'
-            $isAppMode = $commandLine -match '(?i)--app(?:=|\s)' -or $commandLine -match '(?i)--kiosk'
-            $keywordHit = ($url -match $strongRecorderPattern) -or
-                ($title -match $strongRecorderPattern) -or
-                (($isHeadless -or $isAppMode) -and $commandLine -match $strongRecorderPattern)
+            if ($candidateUrl) { $candidatePath = ConvertTo-LocalFilePath $candidateUrl }
 
-            if (-not ($hasHtml -or $keywordHit)) { continue }
+            # Only a local HTML file actually opened by the browser and containing
+            # recording APIs qualifies. Titles/URLs/keywords alone are not evidence.
+            if (-not $candidatePath) { continue }
 
-            $kind = if ($hasHtml) {
-                'HTML Recorder'
-            } elseif ($isHeadless -or ($isAppMode -and [string]::IsNullOrWhiteSpace($title))) {
-                'Hidden Browser Recorder'
-            } else {
-                'Browser Recorder'
-            }
+            $fileEvidence = Get-HtmlApiEvidence -Path $candidatePath
+            if (-not ($fileEvidence -and $fileEvidence.Strong)) { continue }
 
-            $detail = if ($url) { $url } elseif ($title) { $title } else { 'Hidden browser instance (no window title)' }
+            $kind = 'HTML recorder candidate'
+            $confidence = if ($fileEvidence.Matches.Count -ge 2) { 'Medium' } else { 'Low' }
+            $detail = "$candidatePath (APIs: $($fileEvidence.Matches -join ', '))"
+            $evidence = 'Local file opened by browser contains recording APIs; no active capture verified'
+
             $key = "$kind|$baseName|$detail"
             if (-not $seen.Add($key)) { continue }
 
@@ -2151,283 +3204,212 @@ function Get-BrowserRecorderFindings {
                 Kind        = $kind
                 Name        = "$($proc.Name) (PID $($proc.ProcessId))"
                 Detail      = $detail
+                Confidence  = $confidence
+                Evidence    = $evidence
                 ProcessName = $baseName
             })
         } catch {}
-    }
-
-    $extensionRoots = @(
-        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'),
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'),
-        (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data'),
-        (Join-Path $env:LOCALAPPDATA 'Vivaldi\User Data'),
-        (Join-Path $env:LOCALAPPDATA 'Chromium\User Data')
-    )
-
-    foreach ($root in $extensionRoots) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-
-        foreach ($profileDir in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue)) {
-            $extensionsRoot = Join-Path $profileDir.FullName 'Extensions'
-            if (-not (Test-Path -LiteralPath $extensionsRoot)) { continue }
-
-            $manifests = @(Get-ChildItem -LiteralPath $extensionsRoot -Filter 'manifest.json' -Recurse -Depth 3 -Force -File -ErrorAction SilentlyContinue |
-                Select-Object -First 400)
-
-            foreach ($manifest in $manifests) {
-                try {
-                    $json = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
-                    $name = [string]$json.name
-                    $description = [string]$json.description
-                    $permissions = @($json.permissions) + @($json.optional_permissions)
-                    $capturePermission = @($permissions | Where-Object {
-                        $_ -match '(?i)desktopCapture|tabCapture|videoCapture|audioCapture'
-                    }).Count -gt 0
-
-                    $nameHit = ($name -match $recorderPattern) -or ($description -match '(?i)(screen[\s_.-]?record|screen[\s_.-]?captur|screencast|grabador|captura de pantalla|desktop capture|tab capture)')
-                    $permissionHit = $capturePermission -and (($name -match '(?i)record|capture|screen|grab|cast|rec)') -or ($description -match '(?i)record|capture|screen|grab|cast|rec'))
-
-                    if (-not ($nameHit -or $permissionHit)) { continue }
-
-                    $key = "Extension|$($manifest.FullName)"
-                    if (-not $seen.Add($key)) { continue }
-
-                    $findings.Add([pscustomobject]@{
-                        Kind        = if ($capturePermission) { 'Browser Recorder Extension' } else { 'Recorder Extension' }
-                        Name        = if ($name) { $name } else { $manifest.Directory.Parent.Name }
-                        Detail      = $manifest.FullName
-                        ProcessName = $null
-                    })
-                } catch {}
-            }
-        }
-    }
-
-    $firefoxProfiles = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
-    if (Test-Path -LiteralPath $firefoxProfiles) {
-        foreach ($profile in @(Get-ChildItem -LiteralPath $firefoxProfiles -Directory -ErrorAction SilentlyContinue)) {
-            $extensionsFile = Join-Path $profile.FullName 'extensions.json'
-            if (-not (Test-Path -LiteralPath $extensionsFile)) { continue }
-
-            try {
-                $extensions = Get-Content -LiteralPath $extensionsFile -Raw -ErrorAction Stop | ConvertFrom-Json
-                foreach ($addon in @($extensions.addons)) {
-                    $name = [string]$addon.defaultLocale.name
-                    $description = [string]$addon.defaultLocale.description
-                    if (($name -notmatch $recorderPattern) -and ($description -notmatch $recorderPattern)) { continue }
-
-                    $key = "FirefoxExtension|$([string]$addon.id)"
-                    if (-not $seen.Add($key)) { continue }
-
-                    $findings.Add([pscustomobject]@{
-                        Kind        = 'Recorder Extension'
-                        Name        = if ($name) { $name } else { [string]$addon.id }
-                        Detail      = "Firefox profile: $($profile.Name)"
-                        ProcessName = $null
-                    })
-                }
-            } catch {}
-        }
-    }
-
-    return $findings.ToArray()
-}
-
-function Get-HtmlRecorderFindings {
-    $findings = [Collections.Generic.List[object]]::new()
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $recorderApiPattern = '(?i)(getDisplayMedia|MediaRecorder|desktopCapturer|RecordRTC|screen[\s_.-]?record|navigator\.mediaDevices|tabCapture|getUserMedia|grabador|grabaci[oó]n de pantalla|captura de pantalla|screencast)'
-
-    $roots = @(
-        [Environment]::GetFolderPath('Desktop'),
-        (Join-Path $env:USERPROFILE 'Downloads'),
-        [Environment]::GetFolderPath('MyDocuments'),
-        $env:TEMP
-    )
-
-    foreach ($root in $roots) {
-        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { continue }
-
-        $files = @(Get-ChildItem -LiteralPath $root -Recurse -Depth 3 -Force -File -Filter '*.htm*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 -and $_.Length -le 5MB } |
-            Select-Object -First 500)
-
-        foreach ($file in $files) {
-            if (-not $seen.Add($file.FullName)) { continue }
-
-            $text = ''
-            $stream = $null
-            try {
-                $buffer = New-Object byte[] 262144
-                $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-                $read = $stream.Read($buffer, 0, $buffer.Length)
-                if ($read -gt 0) { $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read) }
-            } catch {
-                continue
-            } finally {
-                if ($stream) { $stream.Dispose() }
-            }
-
-            if ([string]::IsNullOrWhiteSpace($text)) { continue }
-
-            $match = [regex]::Match($text, $recorderApiPattern)
-            if (-not $match.Success) { continue }
-
-            $findings.Add([pscustomobject]@{
-                Kind        = 'HTML Recorder File'
-                Name        = $file.FullName
-                Detail      = "Match: $($match.Value)"
-                ProcessName = $null
-            })
-        }
     }
 
     return $findings.ToArray()
 }
 
 function Invoke-ScreenCaptureKiller {
-    $forbiddenProcesses = @(
-        'chrome','firefox','msedge','opera','opera_gx','brave','vivaldi',
-        'browser','waterfox','librewolf','palemoon','tor','torbrowser',
-        'chromium','ungoogled-chromium','epicbrowser','slimjet','comodo',
-
+    $captureEngines = @(
         'obs','obs32','obs64','streamlabs','camtasia','bandicam','xsplit',
-        'fraps','action','dxtory','sharex','screenrec','flashback','bdcam',
-
-        'gamebar','xboxgamebar','gamebarpresencewriter','broadcastdvr',
-        'discord','discordcanary','discordptb','steam','steamwebhelper',
-        'overwolf','teams','riotclientservices','epicgameslauncher',
-
-        'nvcontainer','nvdisplay.container','nvidiashare','nvbackend',
-        'nvsphelper64','nvstreamer','nvtray','nvtelemetry','nvfbc','nvifrex',
-
-        'amdsoftware','radeonsoftware','amdxcapture','amdenc','amddvr'
+        'fraps','action','dxtory','sharex','screenrec','flashback','bdcam'
     )
 
-    $detected = @{}
+    $browserNames = @(
+        'chrome','firefox','msedge','opera','opera_gx','brave','vivaldi',
+        'browser','waterfox','librewolf','palemoon','tor','torbrowser',
+        'chromium','epicbrowser','slimjet','comodo','msedgewebview2'
+    )
+
+    $shareApps = @(
+        'discord','discordcanary','discordptb','teams','ms-teams','zoom','slack',
+        'skype','telegram','whatsapp','steam','steamwebhelper','overwolf',
+        'medal','gamebar','xboxgamebar','xboxgamebarwidgets','nvcontainer',
+        'nvdisplay.container','amdsoftware','radeonsoftware'
+    )
+
     $recorderFindings = @()
-
     try {
-        $recorderFindings = @(Get-BrowserRecorderFindings) + @(Get-HtmlRecorderFindings)
-    } catch {}
+        $recorderFindings = @(Get-BrowserRecorderFindings)
+    } catch {
+        Add-ScanIssue 'Screen capture' "No se pudieron enumerar grabadoras: $($_.Exception.Message)"
+    }
 
-    $allProcs = Get-Process -ErrorAction SilentlyContinue
+    $detected = [Collections.Generic.List[object]]::new()
+    $capableApps = [ordered]@{}
 
-    foreach ($proc in $allProcs) {
+    # Capture engines are listed individually so they can be closed on request.
+    # Browsers and screen-share apps are inventoried as capture-capable only:
+    # running does not mean recording, and they are never closed automatically.
+    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
         try {
             $name = $proc.Name.ToLower()
-            $isForbidden = $forbiddenProcesses -contains $name
-            $isCapture = $false
 
-            $modules = $proc.Modules.ModuleName
-            if (
-                $modules -contains 'Windows.Graphics.Capture.dll' -or
-                $modules -match 'graphicscapture' -or
-                $modules -match 'nvencodeapi' -or
-                $modules -match 'amdenc|amf'
-            ) {
-                $isCapture = $true
-            }
-
-            if (($isForbidden -or $isCapture) -and -not $detected.ContainsKey($name)) {
-                $detected[$name] = @{
-                    Name = $proc.Name
-                    Type = if ($isForbidden -and $isCapture) {
-                        'Capture + Forbidden'
-                    } elseif ($isCapture) {
-                        'Screen Capture'
-                    } else {
-                        'Forbidden Process'
-                    }
+            if ($captureEngines -contains $name) {
+                $detected.Add([pscustomobject]@{
+                    Name     = $proc.Name
+                    PID      = $proc.Id
+                    Category = 'Capture engine'
+                    Closable = $true
+                })
+            } elseif (($browserNames -contains $name) -or ($shareApps -contains $name)) {
+                if ($capableApps.Contains($name)) {
+                    $capableApps[$name] = [int]$capableApps[$name] + 1
+                } else {
+                    $capableApps[$name] = 1
                 }
             }
         } catch {}
     }
 
-    if ($detected.Count -eq 0 -and $recorderFindings.Count -eq 0) {
-        Write-Host ($infoIndex + 'No capture processes or HTML/browser recorders detected.') -ForegroundColor $successColor
+    if ($detected.Count -eq 0 -and $recorderFindings.Count -eq 0 -and $capableApps.Count -eq 0) {
+        Write-Host ($infoIndex + 'No capture-capable processes or verified HTML recorder evidence detected.') -ForegroundColor $successColor
         return
     }
 
     if ($detected.Count -gt 0) {
-        Write-Host ($infoIndex + 'Detected processes:') -ForegroundColor $warnColor
         Write-Host ''
+        Write-Host ($infoIndex + 'Capture engines running (closable on request):') -ForegroundColor $warnColor
+        foreach ($item in $detected) {
+            Write-Host ($infoIndex + ('  - {0}.exe [PID {1}]' -f $item.Name, $item.PID)) -ForegroundColor $titleColor
+        }
+    }
 
-        foreach ($item in $detected.Values) {
-            Write-Host ($infoIndex + ('  - {0}.exe [{1}]' -f $item.Name, $item.Type)) -ForegroundColor $titleColor
+    if ($capableApps.Count -gt 0) {
+        Write-Host ''
+        Write-Host ($infoIndex + 'Capture-capable apps/browsers (report only, never closed):') -ForegroundColor $subtColor
+        foreach ($entry in $capableApps.GetEnumerator()) {
+            Write-Host ($infoIndex + ('  - {0}.exe x{1} [running does not mean recording]' -f $entry.Key, $entry.Value)) -ForegroundColor $textColor
         }
     }
 
     if ($recorderFindings.Count -gt 0) {
-        if ($detected.Count -gt 0) { Write-Host '' }
-
-        Write-Host ($infoIndex + 'HTML / browser recorders:') -ForegroundColor $warnColor
         Write-Host ''
+        Write-Host ($infoIndex + 'HTML recorder candidates (not proof of active recording):') -ForegroundColor $warnColor
 
         foreach ($finding in $recorderFindings) {
             Write-Host ($infoIndex + ('  - [{0}] {1}' -f $finding.Kind, $finding.Name)) -ForegroundColor $titleColor
-            Write-Host ($infoIndex + '      |- ') -ForegroundColor $subtColor -NoNewline
-            Write-Host $finding.Detail -ForegroundColor $warnColor
+            Write-Host ($infoIndex + '      |- Confidence: ' + $finding.Confidence) -ForegroundColor $subtColor
+            Write-Host ($infoIndex + '      |- Evidence:   ' + $finding.Evidence) -ForegroundColor $subtColor
+            if ($finding.Detail) {
+                Write-Host ($infoIndex + '      |- Detail:     ' + $finding.Detail) -ForegroundColor $subtColor
+            }
         }
     }
 
-    if ($detected.Count -eq 0) {
+    $closable = @($detected | Where-Object { $_.Closable })
+    if ($closable.Count -eq 0) {
         Write-Host ''
-        Write-Host ($infoIndex + 'No process to kill. Only HTML/browser recorder artifacts were found.') -ForegroundColor $warnColor
+        Write-Host ($infoIndex + 'No capture engine available to close. Nothing was terminated.') -ForegroundColor $warnColor
         return
     }
 
     Write-Host ''
-    Write-Host ($infoIndex + '[A] Kill all detected processes.') -ForegroundColor $textColor
-    Write-Host ($infoIndex + '[B] Kill 1 specific process.') -ForegroundColor $textColor
-    Write-Host ($infoIndex + '[C] Kill all except 1 process.') -ForegroundColor $textColor
+    Write-Host ($infoIndex + 'Process closing is report-only by default.') -ForegroundColor $subtColor
+    Write-Host ($infoIndex + '[D] Do nothing (default)') -ForegroundColor $textColor
+    Write-Host ($infoIndex + '[G] Graceful close one capture engine') -ForegroundColor $textColor
+    Write-Host ($infoIndex + '[F] Force kill one capture engine (requires typing KILL)') -ForegroundColor $textColor
+    Write-Host ''
+    Write-Host ($infoIndex + 'Closable capture engines:') -ForegroundColor $subtColor
+    for ($i = 0; $i -lt $closable.Count; $i++) {
+        Write-Host ($infoIndex + ('  [{0}] {1}.exe [PID {2}]' -f ($i + 1), $closable[$i].Name, $closable[$i].PID)) -ForegroundColor $titleColor
+    }
     Write-Host ''
 
-    $choice = Read-Host '  Select option (A / B / C)'
+    $choice = Read-Host '  Select option (D / G / F) [D]'
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'D' }
 
     switch ($choice.ToUpper()) {
-        'A' {
-            foreach ($item in $detected.Values) {
-                Get-Process -Name $item.Name -ErrorAction SilentlyContinue |
-                    Stop-Process -Force
-                Write-Host "[Terminated] $($item.Name).exe" -ForegroundColor $dangerColor
-            }
-        }
-        'B' {
-            $target = Read-Host '  Enter process name (example: chrome or chrome.exe)'
-            $target = $target.ToLower().Replace('.exe', '')
-
-            if ($detected.ContainsKey($target)) {
-                Get-Process -Name $target -ErrorAction SilentlyContinue |
-                    Stop-Process -Force
-                Write-Host "[Terminated] $target.exe" -ForegroundColor $dangerColor
-            } else {
-                Write-Host '[Error] Process not found.' -ForegroundColor $dangerColor
-            }
-        }
-        'C' {
-            $exclude = Read-Host '  Enter process name to keep alive (example: chrome or chrome.exe)'
-            $exclude = $exclude.ToLower().Replace('.exe', '')
-
-            if (-not $detected.ContainsKey($exclude)) {
-                Write-Host '[Error] Process not found.' -ForegroundColor $dangerColor
+        'G' {
+            $selection = Read-Host '  Enter the engine number to close gracefully'
+            $index = 0
+            if (-not [int]::TryParse($selection, [ref]$index) -or $index -lt 1 -or $index -gt $closable.Count) {
+                Write-Host '[Error] Invalid selection. Nothing was closed.' -ForegroundColor $dangerColor
                 return
             }
 
-            foreach ($key in $detected.Keys) {
-                if ($key -ne $exclude) {
-                    Get-Process -Name $key -ErrorAction SilentlyContinue |
-                        Stop-Process -Force
-                    Write-Host "[Terminated] $key.exe" -ForegroundColor $dangerColor
+            $target = $closable[$index - 1]
+            try {
+                $proc = Get-Process -Id $target.PID -ErrorAction Stop
+                if ($proc.MainWindowHandle -eq 0) {
+                    Write-Host "[Info] $($target.Name).exe (PID $($target.PID)) has no main window; use force kill if needed." -ForegroundColor $warnColor
+                    return
                 }
+
+                $sent = $proc.CloseMainWindow()
+                if (-not $sent) {
+                    Write-Host "[Info] Could not send a close request to PID $($target.PID)." -ForegroundColor $warnColor
+                    return
+                }
+
+                if ($proc.WaitForExit(5000)) {
+                    Write-Host "[Closed] $($target.Name).exe (PID $($target.PID))" -ForegroundColor $successColor
+                } else {
+                    Write-Host "[Still running] PID $($target.PID) did not exit after 5 seconds. Not forced." -ForegroundColor $warnColor
+                }
+            } catch {
+                Write-Host "[Error] $($_.Exception.Message)" -ForegroundColor $dangerColor
+            }
+        }
+        'F' {
+            $selection = Read-Host '  Enter the engine number to force kill'
+            $index = 0
+            if (-not [int]::TryParse($selection, [ref]$index) -or $index -lt 1 -or $index -gt $closable.Count) {
+                Write-Host '[Error] Invalid selection. Nothing was closed.' -ForegroundColor $dangerColor
+                return
             }
 
-            Write-Host "[+] Kept alive: $exclude.exe" -ForegroundColor $successColor
+            $target = $closable[$index - 1]
+            Write-Host ''
+            Write-Host "[Warning] Unsaved work in $($target.Name).exe (PID $($target.PID)) will be lost." -ForegroundColor $dangerColor
+            $confirm = Read-Host '  Type KILL to continue'
+            if ($confirm -cne 'KILL') {
+                Write-Host '[Cancelled] Nothing was closed.' -ForegroundColor $successColor
+                return
+            }
+
+            try {
+                Stop-Process -Id $target.PID -Force -ErrorAction Stop
+                Write-Host "[Killed] $($target.Name).exe (PID $($target.PID))" -ForegroundColor $dangerColor
+            } catch {
+                Write-Host "[Error] $($_.Exception.Message)" -ForegroundColor $dangerColor
+            }
+        }
+        default {
+            Write-Host '[Report only] No process was closed.' -ForegroundColor $successColor
         }
     }
 }
 
 Invoke-ScreenCaptureKiller
+
+# --- READ ERRORS ---------------------------------------------------------------
+Write-Host ''
+Write-SectionHeader 'READ ERRORS'
+
+$scanIssues = @($script:ScanIssues | Sort-Object Area, Detail -Unique)
+
+if ($scanIssues.Count -eq 0) {
+    Write-Host ($infoIndex + 'No read errors recorded.') -ForegroundColor $successColor
+} else {
+    Write-Host ($infoIndex + ("{0} check(s) could not be fully verified:" -f $scanIssues.Count)) -ForegroundColor $warnColor
+    Write-Host ''
+
+    foreach ($areaGroup in @($scanIssues | Group-Object Area | Sort-Object Name)) {
+        Write-Host ($infoIndex + '[' + $areaGroup.Name + ']') -ForegroundColor $titleColor
+        foreach ($issue in @($areaGroup.Group)) {
+            Write-Host ($infoIndex + '  |- ' + $issue.Detail) -ForegroundColor $warnColor
+        }
+    }
+
+    Write-Host ''
+    Write-Host ($infoIndex + 'Treat UNKNOWN / REVIEW results as unverified, not as clean.') -ForegroundColor $subtColor
+}
 
 # --- Footer -------------------------------------------------------------------
 Write-Host ''
